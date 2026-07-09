@@ -377,7 +377,7 @@ Add two rewrites:
 | `<your-domain>` | `<ip>` |
 | `*.<your-domain>` | `<ip>` |
 
-This makes all `*.<your-domain>` queries resolve to nginx proxy manager. Unbound forwards to AdGuard, AdGuard answers with the rewrite.
+This makes all `*.<your-domain>` queries resolve to the reverse proxy. When clients query AdGuard directly (recommended, see Part 5) AdGuard answers with the rewrite; if clients still use Unbound, Unbound forwards to AdGuard.
 
 Verify:
 ```bash
@@ -401,11 +401,32 @@ drill google.com @127.0.0.1
 |---------|-------|
 | Enable | ✓ |
 | Range | <ip> – <ip> |
-| DNS Servers | <ip> (Unbound on OPNsense) |
+| DNS Servers | `<adguard-ip>,<router-ip>` (AdGuard primary, router/Unbound fallback) |
 | Gateway | <ip> |
 | Domain | <your-domain> |
 | Default Lease Time | 43200 (12h) |
 | Maximum Lease Time | 86400 (24h) |
+
+> **Hand clients AdGuard primary + the router/Unbound as fallback.** Set the LAN
+> subnet's DNS servers to `<adguard-ip>,<router-ip>` (comma-separated, ordered),
+> applied via the same Kea subnet editor used for IoT below (**Services > Kea
+> DHCP > Subnets** → edit the LAN subnet → advanced mode → uncheck **Auto collect
+> option data** → set **DNS servers** → Save → apply). AdGuard authoritatively
+> serves the `*.<your-domain>` wildcard rewrite; if clients were pointed only at
+> Unbound they could get **NXDOMAIN for wildcard-only names** (only explicitly
+> overridden hosts resolve).
+>
+> **Fallback completeness caveat.** With the router as secondary, Unbound's
+> `forward-first` recurses when AdGuard is down, so **external** names keep
+> working — but **internal `*.<your-domain>` names do not** during an AdGuard
+> outage (Unbound forwards the domain to the dead AdGuard; recursion hits public
+> DNS with no service records). A true local wildcard is **not cleanly possible
+> on OPNsense 26 unboundplus**: no custom-options field, wildcard host overrides
+> validate but are silently dropped (never rendered into `host_entries.conf`),
+> and `/var/unbound/etc/*.conf` custom files are wiped on `unbound restart`/boot.
+> To fully close it: explicit per-service host overrides → the reverse proxy, or
+> **resolver HA** (a second AdGuard/Pi-hole instance as a real secondary — on the
+> roadmap). This gap may be acceptable to leave for a homelab.
 
 **Services > DHCPv4 > IOT**
 
