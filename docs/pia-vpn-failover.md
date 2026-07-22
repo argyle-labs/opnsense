@@ -113,6 +113,51 @@ Field state is a half-finished Sweden→Vancouver→Montreal migration:
   Vancouver value. The plugin should converge naming/state to the live region
   and prune dead gateways.
 
+## Kill switch — the non-obvious required setting
+
+Rule ordering alone is NOT enough. Field state had the correct rules already:
+`pass … route-to (PIA gw) from <src> to any`, immediately followed by
+`block drop quick from <src> to any`. **But it leaked**, because the global
+**`<skiprulewhengwdown>`** (System → Settings → Advanced → "Skip rules when
+gateway is down") was OFF. With it off, when the PIA gateway goes down OPNsense
+*strips the route-to* and the pass rule becomes a plain pass → traffic exits the
+**WAN** (deanonymizing leak) and the block-below is never reached. The plugin
+MUST ensure `skiprulewhengwdown=1` whenever it manages a VPN kill-switch, then
+`configctl filter reload`. Verify with `pfctl -sr` that the `route-to` pass is
+immediately followed by the `block drop quick` for the same source.
+
+## Field implementation as of 2026-07-21 (what the plugin should absorb)
+
+Interim hand-built pieces now live on the firewall (to be replaced by the
+plugin's typed logic):
+- **`/conf/pia-failover.py`** — companion to the existing `piawireguard monitor`
+  configd cron (`*/5`). Runs at `3-59/5` (offset). Two jobs: (1) sync the
+  forwarded-port alias to the live PF port every cycle (works around the broken
+  `setItem`); (2) region-flip fallback — after 3 consecutive stale-handshake
+  cycles, toggle `regionId` `ca`↔`nl_amsterdam` and `--changeserver`. State in
+  `/tmp/pia_failover_state.json`. Logs best-effort to `/conf/pia-failover.log`
+  (NOT `/var/log` — see RAM-disk note). Wired via configd action
+  `actions_piafailover.conf` + a `<cron>` job in config.xml.
+- **`skiprulewhengwdown=1`** enabled (kill-switch enabler, above).
+
+### `/var/log` RAM-disk caveat
+
+OPNsense "Use RAM disks" mounts a **tmpfs over `/var/log`** (observed 2.5G).
+Heavy filter + `flowd.log` (NetFlow) logging — amplified by torrent traffic —
+filled it to 100%, which breaks logging system-wide and makes any tool that
+writes under `/var/log` crash with `ENOSPC`. The plugin's own logging must NOT
+depend on `/var/log`; log to a persistent path or syslog. Operationally the box
+also needs flow/filter log retention trimmed (or a larger RAM disk) so it does
+not refill.
+
+### Gateway far-VIP drift
+
+The PIA gateway's `<gateway>` far-VIP (e.g. `10.20.128.1`) is server-specific
+and changes on every server rotation, yet route-to still works via the WG iface
+even when the value is stale (point-to-point). The plugin should re-sync the
+gateway `<gateway>` to the live `server_vip` on each reprovision (config.xml +
+`configctl interface routes configure`) so gateway state stays coherent.
+
 ## `status` should surface
 
 tunnel handshake age, current region/server + `server_ip`, PIA forwarded port,
