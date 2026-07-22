@@ -158,6 +158,50 @@ even when the value is stale (point-to-point). The plugin should re-sync the
 gateway `<gateway>` to the live `server_vip` on each reprovision (config.xml +
 `configctl interface routes configure`) so gateway state stays coherent.
 
+## Field artifacts inventory (what is live on the firewall today)
+
+The interim hand-built solution the plugin must absorb and then replace:
+
+| Artifact | Location (OPNsense) | Purpose |
+|---|---|---|
+| `PIAWireguard.py` + `PIAWireguard.json` | `/conf/` | 3rd-party: region/server provisioning, in-region rotation. `regionId` currently `ca` (Montreal). Cron `piawireguard monitor` `*/5`. |
+| `pia-failover.py` | `/conf/` | Our companion: PF-alias sync + `configctl filter reload` on port change + region-flip `ca`↔`nl_amsterdam` after 3 stale cycles. Cron `piafailover run` `3-59/5`. Logs `/conf/pia-failover.log`. |
+| configd action | `actions.d/actions_piafailover.conf` | exposes `piafailover run`. |
+| Forwarded-port alias | firewall alias `pia_vancouver_port` (port type) | holds live PIA PF port; kept in sync by `pia-failover.py`. |
+| Source alias | firewall alias `vpn_hosts_sweden` = `[10.10.10.15]` | hosts policy-routed via PIA (freyr). |
+| Policy-route pass | filter rule, LAN, src `vpn_hosts_sweden` → any, gw `GW_PIA_VANCOUVER` | forces freyr out PIA. |
+| Kill-switch block | filter rule directly below, block quick, src `vpn_hosts_sweden` → any | drops freyr if PIA down (requires `skiprulewhengwdown=1`). |
+| Inbound port-forward | NAT rdr on `opt4` (WG), dst `opt4ip`:`pia_vancouver_port` → `10.10.10.15:6881` | incoming torrent peers reach qBittorrent. |
+| Global setting | `<system><skiprulewhengwdown>1` | makes the kill-switch actually engage. |
+| Live gateway/iface | `GW_PIA_VANCOUVER` = `opt4` = `wg4` | the one live tunnel (Montreal). |
+| Stale to prune | `GW_PIA_SWEDEN` (opt3), `GW_PIA_USWEST` (opt5) + `*sweden*` naming | migration remnants. |
+
+## Integration checklist (move the above into plugin code)
+
+`configure` (idempotent, driven by a typed PIA-VPN config block):
+- [ ] **Region/server**: set PIA region (validate id against the live server
+  list), provision the WG instance/peer via OPNsense API, MTU 1420.
+- [ ] **Forwarded port**: acquire PIA PF signature/bindPort bound to the tunnel;
+  write `pia_vancouver_port` alias via `/api/firewall/alias*` (https, self-signed
+  cert) + `alias/reconfigure` + **`filter reload`** (port aliases are macros).
+- [ ] **Inbound rdr**: NAT port-forward on the WG interface, dst `<wgif>ip`:PF-port
+  → `<torrent_host>:<listen_port>`, tcp/udp, `associated-rule-id: pass`.
+- [ ] **Kill switch**: ensure the pass-via-gw rule + block-below pair AND set
+  `skiprulewhengwdown=1`; verify with `pfctl`.
+- [ ] **Failover (Option B)**: handshake-age check on the real WG iface; on
+  persistent stale, rotate in-region then flip region; re-sync gateway far-VIP
+  to `server_vip` on reprovision.
+- [ ] **Cleanup/converge**: prune stale gateways, converge naming to live region.
+- [ ] Own the `*/5` cadence (replace the two cron/configd shims).
+
+`status`:
+- [ ] handshake age, region/server + `server_ip`, PF port, alias-vs-live match,
+  rdr present, kill-switch present + `skiprulewhengwdown`, last remediation,
+  `/var/log` RAM-disk headroom.
+
+Design references: this doc + the interim scripts in `/conf/` on the firewall
+are the source-of-truth for behavior to port.
+
 ## `status` should surface
 
 tunnel handshake age, current region/server + `server_ip`, PIA forwarded port,
