@@ -7,6 +7,9 @@ generic `service.*` surface — no per-plugin tools. Runtimes: **vm**.
 - [x] `provider` / `runtimes` / `default_port` / `capabilities` / `data_paths` — declarative descriptor
 - [ ] `workload_spec(runtime)` — *what* to run; `deploy_target` renders it to a container / LXC / VM
 - [ ] `configure` — apply opnsense config via its upstream API
+  - [ ] **PIA WireGuard + VPN failover** — region change, forwarded-port wiring,
+    handshake-based watchdog failover, kill-switch. Full design + field gotchas:
+    [`docs/pia-vpn-failover.md`](docs/pia-vpn-failover.md)
 - [ ] `status` — health + rich diagnostics returned in the typed `ServiceStatus.info`
 
 > Declarative descriptor is implemented and the plugin **registers + loads live**
