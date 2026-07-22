@@ -11,6 +11,10 @@ generic `service.*` surface — no per-plugin tools. Runtimes: **vm**.
     handshake-based watchdog failover, kill-switch. Full design + field gotchas:
     [`docs/pia-vpn-failover.md`](docs/pia-vpn-failover.md)
 - [ ] `status` — health + rich diagnostics returned in the typed `ServiceStatus.info`
+  - [ ] **diagnose + repair registry** — per-check detection + remediation (VPN
+    tunnel/region/PF/kill-switch/leak, gateway hygiene, Insight/NetFlow, host
+    RAM-disk), each repair backup-first + health-gated + auto-rollback. Full
+    registry: [`docs/diagnostics.md`](docs/diagnostics.md)
 
 > Declarative descriptor is implemented and the plugin **registers + loads live**
 > in orca today (`service.list` shows it). `workload_spec`/`configure`/`status`
