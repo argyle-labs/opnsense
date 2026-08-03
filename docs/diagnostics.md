@@ -9,6 +9,10 @@ auto-rollback** (see the guardian pattern at the end).
 
 Severity: 🔴 breaks traffic/leaks · 🟠 degrades · 🟡 hygiene.
 
+> **Status:** design/roadmap. The plugin is backend-only today and ships
+> `configure`/`status`; the `diagnose`/`repair` checks and remediations below
+> are the intended target, not current behavior.
+
 ## PIA WireGuard VPN
 
 ### vpn.tunnel.handshake 🔴
@@ -42,18 +46,18 @@ Severity: 🔴 breaks traffic/leaks · 🟠 degrades · 🟡 hygiene.
 ### pf.alias.synced 🟠
 - **Detect:** firewall alias `pia_vancouver_port` content vs live PIA forwarded
   port (from the PF signature).
-- **Symptom:** empty/stale alias → no incoming peers → slow swarms.
+- **Symptom:** empty/stale alias → no incoming peers → slow transfers.
 - **Gotchas:** `opnsenseURL` must be `https` (http → 301 → silent write fail);
   call `/api/firewall/alias*` directly (self-signed cert). After change:
   `alias/reconfigure` **AND `filter reload`** (port aliases are ruleset macros,
   not live tables — rdr won't pick up the new port without a filter reload).
 
 ### pf.nat.inbound 🔴 (for connectivity)
-- **Detect:** `pfctl -sn | grep 'rdr pass on <wgif>.*-> <torrent_host> port <listen>'`.
-- **Symptom:** absent → qBittorrent unreachable inbound (field: only Plex
-  `:32400` rdr existed; no torrent forward).
+- **Detect:** `pfctl -sn | grep 'rdr pass on <wgif>.*-> <policy_host> port <listen>'`.
+- **Symptom:** absent → download client unreachable inbound (field: only Plex
+  `:32400` rdr existed; no policy-route forward).
 - **Repair:** rdr on the WG interface, dst `<wgif>ip`:`pia_*_port` alias →
-  torrent host:listen-port, tcp/udp, `associated-rule-id: pass`. NB: the rdr
+  policy host:listen-port, tcp/udp, `associated-rule-id: pass`. NB: the rdr
   `<rule>` must be a **direct child of `<nat>` after `</outbound>`** — placing it
   inside `<outbound>` renders a bogus SNAT, not a port-forward.
 
@@ -64,13 +68,13 @@ Severity: 🔴 breaks traffic/leaks · 🟠 degrades · 🟡 hygiene.
   immediately followed by `block drop quick … from <src> to any`; **AND** global
   `<skiprulewhengwdown>1`.
 - **Symptom:** without `skiprulewhengwdown`, a down gateway makes the pass rule a
-  plain pass → traffic exits WAN (deanonymizing leak); the block-below never runs.
+  plain pass → traffic exits WAN (policy-route leak); the block-below never runs.
 - **Verify (active):** compare the policy-routed host's public IP vs WAN IP.
 - **Repair:** ensure the pass/block pair + set `skiprulewhengwdown=1` +
   `filter reload`.
 
 ### route.membership 🟠
-- **Detect:** source alias (field: `vpn_hosts_sweden`) resolves to the intended
+- **Detect:** source alias (field: `vpn_hosts`) resolves to the intended
   hosts (field: `[10.10.10.15]`=freyr).
 
 ## Gateway hygiene 🟡
@@ -96,8 +100,8 @@ Severity: 🔴 breaks traffic/leaks · 🟠 degrades · 🟡 hygiene.
 
 ### insight.db_bloat 🟡
 - **Detect:** `/var/netflow/*_000300.sqlite` size (field: src_addr 745M, dst_port
-  526M — torrent flow cardinality). Large 5-min DBs precede corruption.
-- **Repair/lever:** narrow NetFlow capture (exclude torrent path), cap retention,
+  526M — high-volume flow cardinality). Large 5-min DBs precede corruption.
+- **Repair/lever:** narrow NetFlow capture (exclude the high-volume path), cap retention,
   or disable Insight if unused.
 
 ## Host

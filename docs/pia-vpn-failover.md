@@ -1,20 +1,24 @@
 # PIA WireGuard + VPN failover (plugin implementation notes)
 
 Durable design notes for what the `opnsense` plugin must own for the PIA
-WireGuard tunnel that carries a torrent host's traffic. Today this is
+WireGuard tunnel that carries a policy-routed LAN host's traffic. Today this is
 hand-maintained on the firewall over root SSH via the third-party
 [FingerlessGloves `PIAWireguard.py`](https://github.com/FingerlessGlov3s/OPNsensePIAWireguard)
 script plus ad-hoc `pia-watchdog`/`pia-refresh` shell scripts. The plugin
 should replace all of it with typed `configure`/`status` logic driven by the
 OPNsense API.
 
+> **Status:** design/roadmap. The plugin is backend-only today and ships
+> `configure`/`status`; the failover, port-forward wiring, and self-healing
+> described below are the intended target, not current behavior.
+
 ## Goal
 
 A single always-configured PIA WireGuard tunnel that:
 1. Routes a defined set of hosts (policy-based routing) out PIA, never leaking.
-2. Uses a **fast, torrent-friendly, port-forward-capable** region (e.g. PIA
+2. Uses a **fast, port-forward-capable** region (e.g. PIA
    Montreal — region id `ca`; NL `nl_amsterdam` as the fallback region).
-3. Keeps its **forwarded port** wired end-to-end to the torrent client.
+3. Keeps its **forwarded port** wired end-to-end to the download client.
 4. **Self-heals**: detects a dead/degraded tunnel and reprovisions (rotate
    server within region, then flip region) — **Option B, handshake-based**.
 
@@ -58,7 +62,7 @@ WireGuard's honest health signal is **latest-handshake age**, not ICMP.
    - Pass rule: PIA-routed source hosts → gateway = PIA WG gateway.
    - **Block rule directly below** with no gateway → when the tunnel is down the
      pass rule can't match and the block rule drops the traffic. Prevents the
-     deanonymizing WAN leak that a torrent box must never have.
+     WAN leak that a policy-routed host must never have.
 4. Reprovision-speed failover (~1–3 min) is acceptable for this workload; it
    avoids the WG gateway-group bug and keeps a single forwarded port.
 
@@ -71,18 +75,18 @@ ports (client binds one → inbound degrades on failover, downloads continue).
 ## Port forwarding — wire it end to end (was fully broken)
 
 PIA gives a **different forwarded port per server**, re-acquired after every
-region/server change. It must reach the torrent client or inbound peer
-connectivity is dead (slow swarms). The plugin must:
+region/server change. It must reach the download client or inbound peer
+connectivity is dead (slow transfers). The plugin must:
 
 1. After (re)connect, run PIA's port-forward `getSignature` → `bindPort` against
    the connected server, bound to the tunnel interface.
 2. Publish the port to a firewall **alias** (field-observed name
    `pia_vancouver_port`) AND create/maintain an **inbound NAT port-forward**
-   mapping `WAN:<pia_port>` → `<torrent_host>:<listen_port>`. In the field the
-   ONLY inbound forwards were Plex (`:32400`); there was **no** torrent
+   mapping `WAN:<pia_port>` → `<policy_host>:<listen_port>`. In the field the
+   ONLY inbound forwards were Plex (`:32400`); there was **no** policy-route
    forward at all.
-3. Keep the torrent client's **listen port** in sync with the PIA forwarded
-   port (or NAT `pia_port → fixed client port`, e.g. qBittorrent `6881`).
+3. Keep the download client's **listen port** in sync with the PIA forwarded
+   port (or NAT `pia_port → fixed client port`, e.g. `6881`).
 
 ### Alias-update gotchas (OPNsense 26.1)
 
@@ -99,7 +103,7 @@ connectivity is dead (slow swarms). The plugin must:
 
 Valid region ids come from
 `https://serverlist.piaservers.net/vpninfo/servers/v6` (filter
-`port_forward: true` for torrent PF). Notable ids: `ca` = **CA Montreal**
+`port_forward: true` for port forwarding). Notable ids: `ca` = **CA Montreal**
 (NOT `ca_montreal`), `ca_toronto`, `ca_vancouver`, `nl_amsterdam` = Netherlands.
 Throughput is latency-bound from the US → prefer nearest PF-capable region.
 
@@ -108,8 +112,8 @@ Throughput is latency-bound from the US → prefer nearest PF-capable region.
 Field state is a half-finished Sweden→Vancouver→Montreal migration:
 - Stale enabled gateways `GW_PIA_SWEDEN` (opt3) + `GW_PIA_USWEST` (opt5) — the
   live tunnel is `GW_PIA_VANCOUVER` (opt4/wg4), now pointed at Montreal.
-- Rules/aliases still named `*sweden*` (source alias `vpn_hosts_sweden` actually
-  contains just the torrent host); the far-gateway `<gateway>` VIP was a stale
+- Rules/aliases still named `*sweden*` (source alias `vpn_hosts` actually
+  contains just the policy-routed host); the far-gateway `<gateway>` VIP was a stale
   Vancouver value. The plugin should converge naming/state to the live region
   and prune dead gateways.
 
