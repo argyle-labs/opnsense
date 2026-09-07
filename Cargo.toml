@@ -2,7 +2,7 @@
 name = "opnsense"
 version = "0.1.0"
 edition = "2024"
-description = "OPNsense firewall/router appliance — orca service-backend"
+description = "OPNsense firewall/router plugin for orca — service backend + Unbound DNS / DHCP CRUD over the REST API"
 
 [package.metadata.orca]
 category = "networking"
@@ -10,22 +10,45 @@ category = "networking"
 [lib]
 name = "opnsense"
 path = "src/lib.rs"
+# `rlib` retains the in-crate `#[cfg(test)]` harness + lets the workspace use it
+# as a normal Rust lib. The plugin artifact is the `[[bin]]` below.
 crate-type = ["rlib"]
 
+# Plugin entrypoint: a subprocess `[[bin]]` that talks to the orca daemon over
+# its Unix socket via the `Plugin` builder from plugin-toolkit. No FFI/cdylib.
 [[bin]]
 name = "opnsense"
 path = "src/main.rs"
 
-# opnsense is a BACKEND-ONLY orca plugin: zero #[orca_tool]s. It registers a
-# ServiceBackend over the orca socket and reaches the whole orca system
-# through plugin-toolkit alone.
 [dependencies]
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
+# The SOLE orca dependency. Both facets resolve through `plugin_toolkit::*`:
+# the `ServiceBackend` trait (`plugin_toolkit::service`, an always-compiled
+# domain crate) AND the `#[orca_tool]` / `#[endpoint_resource]` machinery plus
+# every orca primitive the tool surface touches (endpoint_db, route, secrets,
+# api_client, reqwest).
+#
+# Thin profile: `delegated-http` retargets the HTTP client onto orca's
+# `http.request` capability, so this plugin links NO reqwest/rustls/hyper.
+# `default-features = false` drops the real `http`/`openapi` stacks and the
+# host-side `in-process` proxies; `tools` (orca_tool anchors) + `db` (thin
+# endpoint_resource CRUD over db_op) + `delegated-http` are all it needs. The
+# `service` domain is a non-optional toolkit dep and `.service()` on the builder
+# is ungated, so the service facet compiles under this same feature set.
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", default-features = false, features = ["tools", "db", "delegated-http"] }
+
+# Light, genuinely-external deps the plugin's own source names at the crate root.
+# Everything else routes through the toolkit + its prelude.
+serde     = { version = "1", features = ["derive"] }
+schemars  = { version = "1", features = ["derive"] }
+anyhow    = "1"
+tracing   = "0.1"
+thiserror = "2"
 
 [dev-dependencies]
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
-tokio    = { version = "1", features = ["macros", "rt-multi-thread"] }
-tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
+# Match orca's workspace lint floor: discarding a Result/Option via
+# `let _ = ...` was a load-bearing past incident, so keep it a hard error here
+# too — the plugin must stay portable back into the orca workspace.
 [lints.clippy]
 let_underscore_must_use = "deny"
