@@ -8,7 +8,7 @@
 
 ## What this capability manages
 
-OPNsense (`opn.scottkey.me`, `10.10.10.1`) runs **Unbound**, which is authoritative
+OPNsense (`opn.scottkey.me`, `10.0.0.1`) runs **Unbound**, which is authoritative
 for internal (split-horizon) resolution of `*.scottkey.me`. Internal clients
 resolve public names to LAN IPs here, so LAN traffic to a service stays on-LAN
 instead of hairpinning out to the WAN/proxy.
@@ -19,16 +19,16 @@ instead of hairpinning out to the WAN/proxy.
   ```
   OPNsense->unboundplus->hosts->host { enabled, hostname, domain, server, description }
   ```
-  Existing override: `opnsense.scottkey.me -> 10.10.10.1 (enabled=1)`.
+  Existing override: `opnsense.scottkey.me -> 10.0.0.1 (enabled=1)`.
 - Host inventory for reservations lives in **Kea DHCP** (`OPNsense->Kea->dhcp4->
-  reservations`), e.g. `gitea ip=10.10.10.20 descr="Gitea CT117@frigg (static)"`.
+  reservations`), e.g. `gitea ip=10.0.0.20 descr="Gitea CT117@frigg (static)"`.
 
 ## Split-horizon lesson learned (Gitea case — DO NOT naively repoint)
 
-`gitea.scottkey.me` internally resolves to **`10.10.10.6` (baldur)** — the Docker
-Caddy reverse proxy, which terminates TLS. The real Gitea host `10.10.10.20`
+`gitea.scottkey.me` internally resolves to **`10.0.0.6` (baldur)** — the Docker
+Caddy reverse proxy, which terminates TLS. The real Gitea host `10.0.0.20`
 serves **plain HTTP :3000 only (no cert, 443 closed)**. Therefore a host-override
-repointing `gitea.scottkey.me → 10.10.10.20` would **break HTTPS for every LAN
+repointing `gitea.scottkey.me → 10.0.0.20` would **break HTTPS for every LAN
 client**. The correct place to add the missing SSH:2222 route was the proxy
 (Caddy L4 passthrough), NOT DNS. See the `caddy` plugin notes
 (`docs/layer4-tcp-and-gitea-ssh.md`).
@@ -57,5 +57,5 @@ eligible if the target actually serves the expected protocol+cert.
 ## Cross-refs
 - Caddy L4/reverse-proxy side → `caddy` plugin: `docs/layer4-tcp-and-gitea-ssh.md`.
 - Same-subnet caveat: OPNsense NAT/port-forward does NOT sit in the path for
-  intra-LAN traffic (both proxy and target on 10.10.10.0/24), so firewall
+  intra-LAN traffic (both proxy and target on 10.0.0.0/24), so firewall
   port-forwarding is NOT a substitute for the proxy L4 route in that case.
