@@ -75,7 +75,7 @@ Severity: 🔴 breaks traffic/leaks · 🟠 degrades · 🟡 hygiene.
 
 ### route.membership 🟠
 - **Detect:** source alias (field: `vpn_hosts`) resolves to the intended
-  hosts (field: `[10.10.10.15]`=freyr).
+  hosts (field: `[10.0.0.15]`=freyr).
 
 ## Gateway hygiene 🟡
 
