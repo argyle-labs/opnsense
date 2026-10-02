@@ -22,7 +22,7 @@ use plugin_toolkit::clap;
 use plugin_toolkit::reqwest;
 use plugin_toolkit::serde_json::{Value, json};
 use plugin_toolkit::service::{
-    BoxFuture, Endpoint, Runtime, ServiceBackend, ServiceCapability, ServiceError, ServiceStatus,
+    BoxFuture, Routes, Runtime, ServiceBackend, ServiceCapability, ServiceError, ServiceStatus,
     WorkloadSpec,
 };
 use serde::de::DeserializeOwned;
@@ -37,8 +37,8 @@ use thiserror::Error;
 /// one binary, both facets, via the `Plugin` builder. Modeled on the nfs
 /// StorageBackend. See orca/docs/PLUGIN-PROGRAM.md.
 ///
-/// Holds only the provider name; per-instance endpoint/creds come from the
-/// `Endpoint` the generic `service.*` tools hand each op.
+/// Holds only the provider name; per-instance routes/creds come from the
+/// `Routes` the generic `service.*` tools hand each op.
 #[derive(Debug, Clone)]
 pub struct OpnsenseBackend {
     provider: &'static str,
@@ -87,7 +87,8 @@ impl ServiceBackend for OpnsenseBackend {
     fn workload_spec<'a>(
         &'a self,
         _runtime: Runtime,
-        _ep: &'a Endpoint,
+        _instance: &'a str,
+        _routes: &'a Routes,
     ) -> BoxFuture<'a, Result<WorkloadSpec, ServiceError>> {
         // TODO: describe the opnsense workload (image/template, ports, mounts,
         // env) for the chosen runtime. The deploy target turns this into a
@@ -97,7 +98,8 @@ impl ServiceBackend for OpnsenseBackend {
 
     fn configure<'a>(
         &'a self,
-        _ep: &'a Endpoint,
+        _instance: &'a str,
+        _routes: &'a Routes,
         _config: &'a str,
     ) -> BoxFuture<'a, Result<(), ServiceError>> {
         // TODO: apply opnsense-specific config idempotently.
@@ -106,7 +108,8 @@ impl ServiceBackend for OpnsenseBackend {
 
     fn status<'a>(
         &'a self,
-        _ep: &'a Endpoint,
+        _instance: &'a str,
+        _routes: &'a Routes,
     ) -> BoxFuture<'a, Result<ServiceStatus, ServiceError>> {
         // TODO: real health/diagnostics.
         Box::pin(async move { Err(ServiceError::unimplemented("opnsense.status")) })
