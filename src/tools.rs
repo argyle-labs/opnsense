@@ -16,6 +16,7 @@
 //!   - `opnsense.dhcp.reservation.list`         list Kea DHCP reservations
 //!   - `opnsense.dhcp.reservation.set`          idempotent upsert of a MAC->IP reservation
 //!   - `opnsense.dhcp.reservation.delete`       delete the reservation for a MAC
+//!   - `opnsense.pia.forwarded_port`            read the PIA forwarded port from its alias
 //!
 //! Every `set`/`delete` is followed by a `reconfigure` of the owning module so
 //! the change takes effect. Imports flow through `plugin_toolkit::prelude::*`.
@@ -23,7 +24,9 @@
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::serde_json::Value;
 
-use crate::{Config, DotUpstream, HostOverride, Module, Reservation, ServiceState};
+use crate::{
+    Config, DotUpstream, HostOverride, Module, PiaForwardedPort, Reservation, ServiceState,
+};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // opnsense.{list,detail,create,update,delete} — endpoint registry CRUD.
@@ -351,4 +354,36 @@ async fn opnsense_reservation_delete(args: ReservationKeyArgs, _ctx: &ToolCtx) -
     let uuid = crate::delete_reservation(&client, &cfg, &args.hw_address).await?;
     crate::reconfigure(&client, &cfg, Module::Dhcp).await?;
     Ok(uuid)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// opnsense.pia.forwarded_port
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn default_pia_alias() -> String {
+    crate::DEFAULT_PIA_PORT_ALIAS.to_string()
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct PiaForwardedPortArgs {
+    /// Registered opnsense endpoint name.
+    #[arg(long)]
+    pub name: String,
+    /// Firewall alias holding the PIA forwarded port.
+    #[arg(long, default_value = crate::DEFAULT_PIA_PORT_ALIAS)]
+    #[serde(default = "default_pia_alias")]
+    pub alias: String,
+}
+
+/// Read the current PIA forwarded port from its OPNsense firewall alias (written
+/// by the PIA WireGuard script), for handing to the download client.
+#[orca_tool(domain = "opnsense", verb = "pia.forwarded_port", role = "any")]
+async fn opnsense_pia_forwarded_port(
+    args: PiaForwardedPortArgs,
+    _ctx: &ToolCtx,
+) -> Result<PiaForwardedPort> {
+    crate::validate_alias_name(&args.alias)?;
+    let cfg = resolve_config(&args.name).await?;
+    let client = cfg.build_client()?;
+    Ok(crate::pia_forwarded_port(&client, &cfg, &args.alias).await?)
 }

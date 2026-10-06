@@ -213,6 +213,21 @@ impl Module {
     }
 }
 
+/// The PIA forwarded port as published in an OPNsense firewall alias.
+///
+/// `nat_target_address` / `nat_target_port` describe the inbound port-forward
+/// rule for that port; they are `null` because the plugin does not read NAT
+/// rules yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PiaForwardedPort {
+    pub alias: String,
+    pub port: u16,
+    /// Where the port was read from — always `opnsense-alias`.
+    pub source: String,
+    pub nat_target_address: Option<String>,
+    pub nat_target_port: Option<u16>,
+}
+
 /// OPNsense's bootgrid search envelope: `{ "rows": [...], "total": n, ... }`.
 #[derive(Debug, Deserialize)]
 struct SearchResult<T> {
@@ -244,6 +259,10 @@ pub enum OpnsenseError {
         kind: &'static str,
         selector: String,
     },
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
+    #[error("firewall alias {alias}: {reason}")]
+    AliasContent { alias: String, reason: String },
 }
 
 #[derive(Debug, Clone)]
@@ -626,6 +645,130 @@ pub async fn delete_reservation(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// PIA forwarded port (firewall alias)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The alias the third-party `PIAWireguard.py` script writes the forwarded port to.
+pub const DEFAULT_PIA_PORT_ALIAS: &str = "pia_vancouver_port";
+
+/// OPNsense alias-name rules: a letter or `_` first, then `[A-Za-z0-9_]`, at most
+/// 32 chars. Also keeps the name safe to splice into a URL path.
+pub fn validate_alias_name(name: &str) -> Result<(), OpnsenseError> {
+    let mut chars = name.chars();
+    let valid = name.len() <= 32
+        && chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if valid {
+        Ok(())
+    } else {
+        Err(OpnsenseError::InvalidArgument(format!(
+            "alias name {name:?} must match [A-Za-z_][A-Za-z0-9_]* and be at most 32 chars"
+        )))
+    }
+}
+
+/// The entries of an alias's `content` field. `getItem` renders it as an option
+/// map (`{"<v>": {"value": "<v>", "selected": 1}}`); older releases return a
+/// newline-separated string.
+fn alias_content_entries(content: &Value) -> Vec<String> {
+    match content {
+        Value::String(s) => s
+            .split(['\n', ','])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+        Value::Object(map) => map
+            .iter()
+            .filter(|(_, opt)| match opt.get("selected") {
+                Some(Value::Bool(b)) => *b,
+                Some(Value::Number(n)) => n.as_u64() == Some(1),
+                Some(Value::String(s)) => s == "1",
+                _ => false,
+            })
+            .map(|(key, opt)| {
+                opt.get("value")
+                    .and_then(Value::as_str)
+                    .unwrap_or(key)
+                    .trim()
+                    .to_string()
+            })
+            .filter(|s| !s.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Read the PIA forwarded port from firewall alias `alias`: resolve its UUID via
+/// `GET /api/firewall/alias/getAliasUUID/<name>`, then read its content via
+/// `GET /api/firewall/alias/getItem/<uuid>`. The alias must hold exactly one port
+/// in 1–65535. Read-only.
+pub async fn pia_forwarded_port(
+    client: &reqwest::Client,
+    cfg: &Config,
+    alias: &str,
+) -> Result<PiaForwardedPort, OpnsenseError> {
+    validate_alias_name(alias)?;
+    let alias_err = |reason: String| OpnsenseError::AliasContent {
+        alias: alias.to_string(),
+        reason,
+    };
+
+    let lookup: Value = get_json(
+        client,
+        &cfg.api_url(&format!("firewall/alias/getAliasUUID/{alias}")),
+    )
+    .await?;
+    // A missing alias comes back as `[]` or `{}` rather than a 404.
+    let uuid = lookup
+        .get("uuid")
+        .and_then(Value::as_str)
+        .filter(|u| !u.is_empty())
+        .ok_or_else(|| OpnsenseError::NotFound {
+            kind: "firewall alias",
+            selector: alias.to_string(),
+        })?;
+
+    let item: Value = get_json(
+        client,
+        &cfg.api_url(&format!("firewall/alias/getItem/{uuid}")),
+    )
+    .await?;
+    let content = item
+        .get("alias")
+        .and_then(|a| a.get("content"))
+        .ok_or_else(|| OpnsenseError::Malformed(format!("alias {alias}: no alias.content")))?;
+
+    let entries = alias_content_entries(content);
+    let entry = match entries.as_slice() {
+        [] => return Err(alias_err("is empty".to_string())),
+        [one] => one,
+        many => {
+            return Err(alias_err(format!(
+                "holds {} entries ({}), expected exactly one port",
+                many.len(),
+                many.join(", ")
+            )));
+        }
+    };
+    let port = entry
+        .parse::<u16>()
+        .ok()
+        .filter(|p| *p != 0)
+        .ok_or_else(|| alias_err(format!("{entry:?} is not a single port in 1-65535")))?;
+
+    Ok(PiaForwardedPort {
+        alias: alias.to_string(),
+        port,
+        source: "opnsense-alias".to_string(),
+        nat_target_address: None,
+        nat_target_port: None,
+    })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Apply / status
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -723,6 +866,213 @@ mod tests {
     fn search_envelope_defaults_empty() {
         let empty: SearchResult<HostOverride> = plugin_toolkit::serde_json::from_str("{}").unwrap();
         assert!(empty.rows.is_empty());
+    }
+
+    /// Run `pia_forwarded_port` against a mocked `http.request` capability that
+    /// answers each GET by URL suffix; any non-GET or unrouted request fails.
+    fn pia_port_with_mock(
+        alias: &str,
+        routes: &[(&str, u16, &str)],
+    ) -> Result<PiaForwardedPort, OpnsenseError> {
+        use plugin_toolkit::abi::{HttpRequest, HttpResponse};
+        let routes: Vec<(String, u16, String)> = routes
+            .iter()
+            .map(|(p, s, b)| (p.to_string(), *s, b.to_string()))
+            .collect();
+        let sink = Box::new(move |cap: &str, op: &str| {
+            assert_eq!(cap, "http.request");
+            let req: HttpRequest = plugin_toolkit::serde_json::from_str(op).unwrap();
+            assert_eq!(req.method, "GET", "read tool must only GET");
+            let (_, status, body) = routes
+                .iter()
+                .find(|(suffix, _, _)| req.url.ends_with(suffix.as_str()))
+                .unwrap_or_else(|| panic!("unexpected request {}", req.url));
+            Ok::<String, String>(
+                plugin_toolkit::serde_json::to_string(&HttpResponse {
+                    status: *status,
+                    headers: vec![],
+                    body: body.as_bytes().to_vec(),
+                })
+                .unwrap(),
+            )
+        });
+        let cfg = Config::new("https://10.0.0.1", "k", "s").insecure(true);
+        plugin_toolkit::capsink::with_cap_sink(sink, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let client = cfg.build_client()?;
+                pia_forwarded_port(&client, &cfg, alias).await
+            })
+        })
+    }
+
+    const UUID_FOUND: &str = r#"{"uuid":"1111-2222"}"#;
+
+    fn item_with_content(content: &str) -> String {
+        format!(r#"{{"alias":{{"name":"pia_vancouver_port","enabled":"1","content":{content}}}}}"#)
+    }
+
+    #[test]
+    fn pia_port_reads_single_port_alias() {
+        let item = item_with_content(r#"{"51234":{"value":"51234","selected":1}}"#);
+        let got = pia_port_with_mock(
+            DEFAULT_PIA_PORT_ALIAS,
+            &[
+                (
+                    "/api/firewall/alias/getAliasUUID/pia_vancouver_port",
+                    200,
+                    UUID_FOUND,
+                ),
+                ("/api/firewall/alias/getItem/1111-2222", 200, &item),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            PiaForwardedPort {
+                alias: "pia_vancouver_port".into(),
+                port: 51234,
+                source: "opnsense-alias".into(),
+                nat_target_address: None,
+                nat_target_port: None,
+            }
+        );
+        let json = plugin_toolkit::serde_json::to_value(&got).unwrap();
+        assert!(json["nat_target_address"].is_null());
+        assert!(json["nat_target_port"].is_null());
+    }
+
+    #[test]
+    fn pia_port_accepts_string_content() {
+        let item = item_with_content(r#""40000\n""#);
+        let got = pia_port_with_mock(
+            "my_alias",
+            &[
+                ("/getAliasUUID/my_alias", 200, UUID_FOUND),
+                ("/getItem/1111-2222", 200, &item),
+            ],
+        )
+        .unwrap();
+        assert_eq!(got.port, 40000);
+        assert_eq!(got.alias, "my_alias");
+    }
+
+    #[test]
+    fn pia_port_missing_alias_is_not_found() {
+        for missing in ["[]", "{}", r#"{"uuid":""}"#] {
+            let err = pia_port_with_mock(
+                DEFAULT_PIA_PORT_ALIAS,
+                &[("/getAliasUUID/pia_vancouver_port", 200, missing)],
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    OpnsenseError::NotFound {
+                        kind: "firewall alias",
+                        ..
+                    }
+                ),
+                "{missing}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn pia_port_empty_alias_errors() {
+        for content in ["{}", r#""""#, r#"{"":{"value":"","selected":1}}"#] {
+            let item = item_with_content(content);
+            let err = pia_port_with_mock(
+                DEFAULT_PIA_PORT_ALIAS,
+                &[
+                    ("/getAliasUUID/pia_vancouver_port", 200, UUID_FOUND),
+                    ("/getItem/1111-2222", 200, &item),
+                ],
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("is empty"), "{content}: {err}");
+        }
+    }
+
+    #[test]
+    fn pia_port_multiple_entries_error() {
+        let item = item_with_content(
+            r#"{"1000":{"value":"1000","selected":1},"2000":{"value":"2000","selected":1}}"#,
+        );
+        let err = pia_port_with_mock(
+            DEFAULT_PIA_PORT_ALIAS,
+            &[
+                ("/getAliasUUID/pia_vancouver_port", 200, UUID_FOUND),
+                ("/getItem/1111-2222", 200, &item),
+            ],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("holds 2 entries"), "{err}");
+    }
+
+    #[test]
+    fn pia_port_rejects_non_port_values() {
+        for bad in ["0", "65536", "1000:2000", "abc", "-1"] {
+            let item =
+                item_with_content(&format!(r#"{{"{bad}":{{"value":"{bad}","selected":1}}}}"#));
+            let err = pia_port_with_mock(
+                DEFAULT_PIA_PORT_ALIAS,
+                &[
+                    ("/getAliasUUID/pia_vancouver_port", 200, UUID_FOUND),
+                    ("/getItem/1111-2222", 200, &item),
+                ],
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, OpnsenseError::AliasContent { .. })
+                    && err.to_string().contains("not a single port"),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn pia_port_ignores_unselected_options() {
+        let item = item_with_content(
+            r#"{"1000":{"value":"1000","selected":0},"51234":{"value":"51234","selected":1}}"#,
+        );
+        let got = pia_port_with_mock(
+            DEFAULT_PIA_PORT_ALIAS,
+            &[
+                ("/getAliasUUID/pia_vancouver_port", 200, UUID_FOUND),
+                ("/getItem/1111-2222", 200, &item),
+            ],
+        )
+        .unwrap();
+        assert_eq!(got.port, 51234);
+    }
+
+    #[test]
+    fn pia_port_surfaces_api_errors() {
+        let err = pia_port_with_mock(
+            DEFAULT_PIA_PORT_ALIAS,
+            &[("/getAliasUUID/pia_vancouver_port", 401, "unauthorized")],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, OpnsenseError::Api { status: 401, .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn pia_port_rejects_invalid_alias_name_before_any_request() {
+        for bad in ["", "1abc", "pia/../x", "pia port", "a-b", &"a".repeat(33)] {
+            let err = pia_port_with_mock(bad, &[]).unwrap_err();
+            assert!(
+                matches!(err, OpnsenseError::InvalidArgument(_)),
+                "{bad:?}: {err}"
+            );
+        }
+        assert!(validate_alias_name("_x9").is_ok());
+        assert!(validate_alias_name(&"a".repeat(32)).is_ok());
     }
 
     #[test]
