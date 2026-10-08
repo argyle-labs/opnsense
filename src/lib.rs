@@ -214,17 +214,15 @@ impl Module {
 }
 
 /// The PIA forwarded port as published in an OPNsense firewall alias.
-///
-/// `nat_target_address` / `nat_target_port` describe the inbound port-forward
-/// rule for that port; they are `null` because the plugin does not read NAT
-/// rules yet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PiaForwardedPort {
     pub alias: String,
     pub port: u16,
     /// Where the port was read from — always `opnsense-alias`.
     pub source: String,
+    /// Always null: NAT rules are not read.
     pub nat_target_address: Option<String>,
+    /// Always null: NAT rules are not read.
     pub nat_target_port: Option<u16>,
 }
 
@@ -263,6 +261,8 @@ pub enum OpnsenseError {
     InvalidArgument(String),
     #[error("firewall alias {alias}: {reason}")]
     AliasContent { alias: String, reason: String },
+    #[error("PIA port alias discovery: {0}")]
+    AliasDiscovery(String),
 }
 
 #[derive(Debug, Clone)]
@@ -648,24 +648,44 @@ pub async fn delete_reservation(
 // PIA forwarded port (firewall alias)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// The alias the third-party `PIAWireguard.py` script writes the forwarded port to.
-pub const DEFAULT_PIA_PORT_ALIAS: &str = "pia_vancouver_port";
+/// Description `PIAWireguard.py` stamps on the `<prefix>_<instance>_port` alias it
+/// creates; the instance name follows.
+const PIA_ALIAS_DESCRIPTION_PREFIX: &str = "PIA Port forwarded, port from WireGuard PIA instance ";
 
-/// OPNsense alias-name rules: a letter or `_` first, then `[A-Za-z0-9_]`, at most
-/// 32 chars. Also keeps the name safe to splice into a URL path.
+/// OPNsense's `AliasNameField` pattern: one letter, or 2-31 chars of
+/// `[A-Za-z0-9_]` starting with a letter or a single `_` (no `_` alone, no `__`
+/// prefix). Reserved pf keywords and service names are not checked — no alias
+/// can carry one, so a lookup by such a name just finds nothing. Also keeps the
+/// name safe to splice into a URL path.
 pub fn validate_alias_name(name: &str) -> Result<(), OpnsenseError> {
-    let mut chars = name.chars();
-    let valid = name.len() <= 32
-        && chars
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    let b = name.as_bytes();
+    let word = |c: &u8| c.is_ascii_alphanumeric() || *c == b'_';
+    let valid = match b {
+        [c] => c.is_ascii_alphabetic(),
+        [c0, c1, rest @ ..] => {
+            b.len() <= 31
+                && (c0.is_ascii_alphabetic() && word(c1)
+                    || *c0 == b'_' && c1.is_ascii_alphanumeric())
+                && rest.iter().all(word)
+        }
+        [] => false,
+    };
     if valid {
         Ok(())
     } else {
         Err(OpnsenseError::InvalidArgument(format!(
-            "alias name {name:?} must match [A-Za-z_][A-Za-z0-9_]* and be at most 32 chars"
+            "alias name {name:?} must be one letter, or 2-31 chars of [A-Za-z0-9_] \
+             starting with a letter or a single underscore"
         )))
+    }
+}
+
+fn option_selected(opt: &Value) -> bool {
+    match opt.get("selected") {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) => n.as_u64() == Some(1),
+        Some(Value::String(s)) => s == "1",
+        _ => false,
     }
 }
 
@@ -682,12 +702,7 @@ fn alias_content_entries(content: &Value) -> Vec<String> {
             .collect(),
         Value::Object(map) => map
             .iter()
-            .filter(|(_, opt)| match opt.get("selected") {
-                Some(Value::Bool(b)) => *b,
-                Some(Value::Number(n)) => n.as_u64() == Some(1),
-                Some(Value::String(s)) => s == "1",
-                _ => false,
-            })
+            .filter(|(_, opt)| option_selected(opt))
             .map(|(key, opt)| {
                 opt.get("value")
                     .and_then(Value::as_str)
@@ -701,46 +716,140 @@ fn alias_content_entries(content: &Value) -> Vec<String> {
     }
 }
 
-/// Read the PIA forwarded port from firewall alias `alias`: resolve its UUID via
-/// `GET /api/firewall/alias/getAliasUUID/<name>`, then read its content via
-/// `GET /api/firewall/alias/getItem/<uuid>`. The alias must hold exactly one port
-/// in 1–65535. Read-only.
+/// The raw value of an option field. In a `getItem` option map the selected
+/// entry's KEY is the raw value (its `value` is the display label); older
+/// releases return the raw string.
+fn selected_option(field: &Value) -> Option<String> {
+    match field {
+        Value::String(s) => Some(s.clone()),
+        Value::Object(map) => map
+            .iter()
+            .find(|(_, opt)| option_selected(opt))
+            .map(|(key, _)| key.clone()),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AliasRow {
+    #[serde(default)]
+    uuid: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default, rename = "type")]
+    kind: String,
+    #[serde(default)]
+    description: String,
+}
+
+/// Find the PIA port alias via `GET /api/firewall/alias/searchItem`: among
+/// `port`-type aliases, those carrying the description `PIAWireguard.py`
+/// stamps, else those named `*_port`. Exactly one candidate must remain.
+/// Returns `(name, uuid)`.
+async fn discover_pia_alias(
+    client: &reqwest::Client,
+    cfg: &Config,
+) -> Result<(String, String), OpnsenseError> {
+    let result: SearchResult<AliasRow> =
+        get_json(client, &cfg.api_url("firewall/alias/searchItem")).await?;
+    // Current releases put the raw type in `type`; older ones put the label there.
+    let ports: Vec<AliasRow> = result
+        .rows
+        .into_iter()
+        .filter(|r| r.kind == "port" || r.kind == "Port(s)")
+        .collect();
+    let (stamped, rest): (Vec<AliasRow>, Vec<AliasRow>) = ports
+        .into_iter()
+        .partition(|r| r.description.starts_with(PIA_ALIAS_DESCRIPTION_PREFIX));
+    let candidates = if stamped.is_empty() {
+        rest.into_iter()
+            .filter(|r| r.name.ends_with("_port"))
+            .collect()
+    } else {
+        stamped
+    };
+    match <[AliasRow; 1]>::try_from(candidates) {
+        Ok([one]) => Ok((one.name, one.uuid)),
+        Err(none) if none.is_empty() => Err(OpnsenseError::AliasDiscovery(
+            "no port alias carries the PIAWireguard description or a `_port` name; pass --alias"
+                .to_string(),
+        )),
+        Err(many) => Err(OpnsenseError::AliasDiscovery(format!(
+            "{} candidate aliases ({}); pass --alias",
+            many.len(),
+            many.iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
+/// Read the port held by firewall alias `alias` (discovered when `None`, see
+/// [`discover_pia_alias`]). A named alias is resolved via
+/// `GET /api/firewall/alias/getAliasUUID/<name>`; its content is read via
+/// `GET /api/firewall/alias/getItem/<uuid>`. The alias must be an enabled
+/// `port` alias holding exactly one port in 1–65535. Read-only. The caller
+/// validates `alias` with [`validate_alias_name`].
 pub async fn pia_forwarded_port(
     client: &reqwest::Client,
     cfg: &Config,
-    alias: &str,
+    alias: Option<&str>,
 ) -> Result<PiaForwardedPort, OpnsenseError> {
-    validate_alias_name(alias)?;
+    let (alias, uuid) = match alias {
+        Some(alias) => {
+            let lookup: Value = get_json(
+                client,
+                &cfg.api_url(&format!("firewall/alias/getAliasUUID/{alias}")),
+            )
+            .await?;
+            // A missing alias comes back as `[]` or `{}` rather than a 404.
+            let uuid = lookup
+                .get("uuid")
+                .and_then(Value::as_str)
+                .filter(|u| !u.is_empty())
+                .ok_or_else(|| OpnsenseError::NotFound {
+                    kind: "firewall alias",
+                    selector: alias.to_string(),
+                })?;
+            (alias.to_string(), uuid.to_string())
+        }
+        None => discover_pia_alias(client, cfg).await?,
+    };
     let alias_err = |reason: String| OpnsenseError::AliasContent {
-        alias: alias.to_string(),
+        alias: alias.clone(),
         reason,
     };
-
-    let lookup: Value = get_json(
-        client,
-        &cfg.api_url(&format!("firewall/alias/getAliasUUID/{alias}")),
-    )
-    .await?;
-    // A missing alias comes back as `[]` or `{}` rather than a 404.
-    let uuid = lookup
-        .get("uuid")
-        .and_then(Value::as_str)
-        .filter(|u| !u.is_empty())
-        .ok_or_else(|| OpnsenseError::NotFound {
-            kind: "firewall alias",
-            selector: alias.to_string(),
-        })?;
 
     let item: Value = get_json(
         client,
         &cfg.api_url(&format!("firewall/alias/getItem/{uuid}")),
     )
     .await?;
-    let content = item
+    let body = item
         .get("alias")
-        .and_then(|a| a.get("content"))
-        .ok_or_else(|| OpnsenseError::Malformed(format!("alias {alias}: no alias.content")))?;
+        .ok_or_else(|| OpnsenseError::Malformed(format!("alias {alias}: no alias object")))?;
 
+    let kind = body.get("type").and_then(selected_option);
+    if kind.as_deref() != Some("port") {
+        return Err(alias_err(format!(
+            "is of type {}, expected port",
+            kind.as_deref().unwrap_or("<missing>")
+        )));
+    }
+    let enabled = match body.get("enabled") {
+        Some(Value::String(s)) => s == "1",
+        Some(Value::Number(n)) => n.as_u64() == Some(1),
+        Some(Value::Bool(b)) => *b,
+        _ => false,
+    };
+    if !enabled {
+        return Err(alias_err("is disabled".to_string()));
+    }
+
+    let content = body
+        .get("content")
+        .ok_or_else(|| OpnsenseError::Malformed(format!("alias {alias}: no alias.content")))?;
     let entries = alias_content_entries(content);
     let entry = match entries.as_slice() {
         [] => return Err(alias_err("is empty".to_string())),
@@ -753,14 +862,15 @@ pub async fn pia_forwarded_port(
             )));
         }
     };
-    let port = entry
-        .parse::<u16>()
-        .ok()
+    // `u16::from_str` accepts a leading `+`.
+    let port = Some(entry)
+        .filter(|e| e.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|e| e.parse::<u16>().ok())
         .filter(|p| *p != 0)
         .ok_or_else(|| alias_err(format!("{entry:?} is not a single port in 1-65535")))?;
 
     Ok(PiaForwardedPort {
-        alias: alias.to_string(),
+        alias,
         port,
         source: "opnsense-alias".to_string(),
         nat_target_address: None,
@@ -871,7 +981,7 @@ mod tests {
     /// Run `pia_forwarded_port` against a mocked `http.request` capability that
     /// answers each GET by URL suffix; any non-GET or unrouted request fails.
     fn pia_port_with_mock(
-        alias: &str,
+        alias: Option<&str>,
         routes: &[(&str, u16, &str)],
     ) -> Result<PiaForwardedPort, OpnsenseError> {
         use plugin_toolkit::abi::{HttpRequest, HttpResponse};
@@ -908,31 +1018,77 @@ mod tests {
         })
     }
 
+    const ALIAS: &str = "pia_vancouver_port";
     const UUID_FOUND: &str = r#"{"uuid":"1111-2222"}"#;
+    const PORT_TYPE: &str =
+        r#"{"host":{"value":"Host(s)","selected":0},"port":{"value":"Port(s)","selected":1}}"#;
+
+    fn item(kind: &str, enabled: &str, content: &str) -> String {
+        format!(
+            r#"{{"alias":{{"name":"{ALIAS}","enabled":"{enabled}","type":{kind},"content":{content}}}}}"#
+        )
+    }
 
     fn item_with_content(content: &str) -> String {
-        format!(r#"{{"alias":{{"name":"pia_vancouver_port","enabled":"1","content":{content}}}}}"#)
+        item(PORT_TYPE, "1", content)
     }
+
+    /// Read `ALIAS` by name, with getItem returning `item`.
+    fn pia_port_named(item: &str) -> Result<PiaForwardedPort, OpnsenseError> {
+        pia_port_with_mock(
+            Some(ALIAS),
+            &[
+                ("/getAliasUUID/pia_vancouver_port", 200, UUID_FOUND),
+                ("/getItem/1111-2222", 200, item),
+            ],
+        )
+    }
+
+    fn search_rows(rows: &[(&str, &str, &str, &str)]) -> String {
+        let rows: Vec<Value> = rows
+            .iter()
+            .map(|(uuid, name, kind, description)| {
+                json!({"uuid": uuid, "name": name, "type": kind, "description": description})
+            })
+            .collect();
+        json!({ "rows": rows, "total": rows.len() }).to_string()
+    }
+
+    fn pia_port_discovered(search: &str) -> Result<PiaForwardedPort, OpnsenseError> {
+        let item = item_with_content(r#"{"51234":{"value":"51234","selected":1}}"#);
+        pia_port_with_mock(
+            None,
+            &[
+                ("/api/firewall/alias/searchItem", 200, search),
+                ("/getItem/1111-2222", 200, &item),
+            ],
+        )
+    }
+
+    const STAMP: &str = "PIA Port forwarded, port from WireGuard PIA instance vancouver";
 
     #[test]
     fn pia_port_reads_single_port_alias() {
-        let item = item_with_content(r#"{"51234":{"value":"51234","selected":1}}"#);
         let got = pia_port_with_mock(
-            DEFAULT_PIA_PORT_ALIAS,
+            Some(ALIAS),
             &[
                 (
                     "/api/firewall/alias/getAliasUUID/pia_vancouver_port",
                     200,
                     UUID_FOUND,
                 ),
-                ("/api/firewall/alias/getItem/1111-2222", 200, &item),
+                (
+                    "/api/firewall/alias/getItem/1111-2222",
+                    200,
+                    &item_with_content(r#"{"51234":{"value":"51234","selected":1}}"#),
+                ),
             ],
         )
         .unwrap();
         assert_eq!(
             got,
             PiaForwardedPort {
-                alias: "pia_vancouver_port".into(),
+                alias: ALIAS.into(),
                 port: 51234,
                 source: "opnsense-alias".into(),
                 nat_target_address: None,
@@ -945,25 +1101,75 @@ mod tests {
     }
 
     #[test]
-    fn pia_port_accepts_string_content() {
-        let item = item_with_content(r#""40000\n""#);
-        let got = pia_port_with_mock(
-            "my_alias",
-            &[
-                ("/getAliasUUID/my_alias", 200, UUID_FOUND),
-                ("/getItem/1111-2222", 200, &item),
-            ],
-        )
-        .unwrap();
+    fn pia_port_accepts_string_fields() {
+        let got = pia_port_named(&item(r#""port""#, "1", r#""40000\n""#)).unwrap();
         assert_eq!(got.port, 40000);
-        assert_eq!(got.alias, "my_alias");
+    }
+
+    #[test]
+    fn pia_port_discovers_single_stamped_alias() {
+        let search = search_rows(&[
+            ("9999", "pia_hosts", "host", ""),
+            ("8888", "wg_port", "port", "unrelated"),
+            ("1111-2222", "pia_vancouver_port", "port", STAMP),
+        ]);
+        let got = pia_port_discovered(&search).unwrap();
+        assert_eq!(got.alias, "pia_vancouver_port");
+        assert_eq!(got.port, 51234);
+    }
+
+    #[test]
+    fn pia_port_discovery_falls_back_to_port_suffix() {
+        let search = search_rows(&[
+            ("9999", "vpn_port", "host", ""),
+            ("8888", "web_ports", "port", ""),
+            ("1111-2222", "my_pia_port", "Port(s)", "hand-made"),
+        ]);
+        assert_eq!(pia_port_discovered(&search).unwrap().alias, "my_pia_port");
+    }
+
+    #[test]
+    fn pia_port_discovery_with_no_match_errors() {
+        let search = search_rows(&[
+            ("9999", "pia_port", "host", STAMP),
+            ("8888", "web_ports", "port", ""),
+        ]);
+        let err = pia_port_discovered(&search).unwrap_err();
+        assert!(
+            matches!(err, OpnsenseError::AliasDiscovery(_))
+                && err.to_string().contains("no port alias"),
+            "{err}"
+        );
+        let err = pia_port_discovered(r#"{"rows":[]}"#).unwrap_err();
+        assert!(matches!(err, OpnsenseError::AliasDiscovery(_)), "{err}");
+    }
+
+    #[test]
+    fn pia_port_discovery_with_several_matches_lists_candidates() {
+        let montreal = STAMP.replace("vancouver", "montreal");
+        let search = search_rows(&[
+            ("1111-2222", "pia_vancouver_port", "port", STAMP),
+            ("3333", "pia_montreal_port", "port", &montreal),
+            ("4444", "other_port", "port", ""),
+        ]);
+        let err = pia_port_discovered(&search).unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(err, OpnsenseError::AliasDiscovery(_)), "{msg}");
+        assert!(
+            msg.contains("2 candidate aliases (pia_vancouver_port, pia_montreal_port)"),
+            "{msg}"
+        );
+
+        let search = search_rows(&[("1", "a_port", "port", ""), ("2", "b_port", "port", "")]);
+        let msg = pia_port_discovered(&search).unwrap_err().to_string();
+        assert!(msg.contains("(a_port, b_port)"), "{msg}");
     }
 
     #[test]
     fn pia_port_missing_alias_is_not_found() {
         for missing in ["[]", "{}", r#"{"uuid":""}"#] {
             let err = pia_port_with_mock(
-                DEFAULT_PIA_PORT_ALIAS,
+                Some(ALIAS),
                 &[("/getAliasUUID/pia_vancouver_port", 200, missing)],
             )
             .unwrap_err();
@@ -981,49 +1187,46 @@ mod tests {
     }
 
     #[test]
+    fn pia_port_rejects_non_port_alias() {
+        let host =
+            r#"{"host":{"value":"Host(s)","selected":1},"port":{"value":"Port(s)","selected":0}}"#;
+        let err = pia_port_named(&item(host, "1", r#""51234""#)).unwrap_err();
+        assert!(err.to_string().contains("is of type host"), "{err}");
+    }
+
+    #[test]
+    fn pia_port_rejects_disabled_alias() {
+        let err = pia_port_named(&item(PORT_TYPE, "0", r#""51234""#)).unwrap_err();
+        assert!(
+            matches!(err, OpnsenseError::AliasContent { .. })
+                && err.to_string().contains("is disabled"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn pia_port_empty_alias_errors() {
         for content in ["{}", r#""""#, r#"{"":{"value":"","selected":1}}"#] {
-            let item = item_with_content(content);
-            let err = pia_port_with_mock(
-                DEFAULT_PIA_PORT_ALIAS,
-                &[
-                    ("/getAliasUUID/pia_vancouver_port", 200, UUID_FOUND),
-                    ("/getItem/1111-2222", 200, &item),
-                ],
-            )
-            .unwrap_err();
+            let err = pia_port_named(&item_with_content(content)).unwrap_err();
             assert!(err.to_string().contains("is empty"), "{content}: {err}");
         }
     }
 
     #[test]
     fn pia_port_multiple_entries_error() {
-        let item = item_with_content(
+        let err = pia_port_named(&item_with_content(
             r#"{"1000":{"value":"1000","selected":1},"2000":{"value":"2000","selected":1}}"#,
-        );
-        let err = pia_port_with_mock(
-            DEFAULT_PIA_PORT_ALIAS,
-            &[
-                ("/getAliasUUID/pia_vancouver_port", 200, UUID_FOUND),
-                ("/getItem/1111-2222", 200, &item),
-            ],
-        )
+        ))
         .unwrap_err();
         assert!(err.to_string().contains("holds 2 entries"), "{err}");
     }
 
     #[test]
     fn pia_port_rejects_non_port_values() {
-        for bad in ["0", "65536", "1000:2000", "abc", "-1"] {
-            let item =
-                item_with_content(&format!(r#"{{"{bad}":{{"value":"{bad}","selected":1}}}}"#));
-            let err = pia_port_with_mock(
-                DEFAULT_PIA_PORT_ALIAS,
-                &[
-                    ("/getAliasUUID/pia_vancouver_port", 200, UUID_FOUND),
-                    ("/getItem/1111-2222", 200, &item),
-                ],
-            )
+        for bad in ["0", "65536", "1000:2000", "abc", "-1", "+80"] {
+            let err = pia_port_named(&item_with_content(&format!(
+                r#"{{"{bad}":{{"value":"{bad}","selected":1}}}}"#
+            )))
             .unwrap_err();
             assert!(
                 matches!(err, OpnsenseError::AliasContent { .. })
@@ -1035,16 +1238,9 @@ mod tests {
 
     #[test]
     fn pia_port_ignores_unselected_options() {
-        let item = item_with_content(
+        let got = pia_port_named(&item_with_content(
             r#"{"1000":{"value":"1000","selected":0},"51234":{"value":"51234","selected":1}}"#,
-        );
-        let got = pia_port_with_mock(
-            DEFAULT_PIA_PORT_ALIAS,
-            &[
-                ("/getAliasUUID/pia_vancouver_port", 200, UUID_FOUND),
-                ("/getItem/1111-2222", 200, &item),
-            ],
-        )
+        ))
         .unwrap();
         assert_eq!(got.port, 51234);
     }
@@ -1052,7 +1248,7 @@ mod tests {
     #[test]
     fn pia_port_surfaces_api_errors() {
         let err = pia_port_with_mock(
-            DEFAULT_PIA_PORT_ALIAS,
+            Some(ALIAS),
             &[("/getAliasUUID/pia_vancouver_port", 401, "unauthorized")],
         )
         .unwrap_err();
@@ -1063,16 +1259,28 @@ mod tests {
     }
 
     #[test]
-    fn pia_port_rejects_invalid_alias_name_before_any_request() {
-        for bad in ["", "1abc", "pia/../x", "pia port", "a-b", &"a".repeat(33)] {
-            let err = pia_port_with_mock(bad, &[]).unwrap_err();
+    fn alias_name_follows_opnsense_rules() {
+        for ok in ["a", "_x9", "a_", "a__b", "Ab1", &"a".repeat(31)] {
+            assert!(validate_alias_name(ok).is_ok(), "{ok:?}");
+        }
+        for bad in [
+            "",
+            "_",
+            "__x",
+            "1abc",
+            "pia/../x",
+            "pia port",
+            "a-b",
+            &"a".repeat(32),
+        ] {
             assert!(
-                matches!(err, OpnsenseError::InvalidArgument(_)),
-                "{bad:?}: {err}"
+                matches!(
+                    validate_alias_name(bad),
+                    Err(OpnsenseError::InvalidArgument(_))
+                ),
+                "{bad:?}"
             );
         }
-        assert!(validate_alias_name("_x9").is_ok());
-        assert!(validate_alias_name(&"a".repeat(32)).is_ok());
     }
 
     #[test]
