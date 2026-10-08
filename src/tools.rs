@@ -372,17 +372,14 @@ pub struct PiaForwardedPortArgs {
     pub alias: Option<String>,
 }
 
-/// Return the port the PIA firewall alias currently holds. This is the alias's
-/// content as written by the PIA WireGuard script, NOT verified against PIA — it
-/// can be stale or empty if the script has not run or failed.
+/// Return the port the PIA firewall alias currently holds, as written by the PIA
+/// WireGuard script. NOT verified against PIA: the value can be stale (the script
+/// may not have run or may have failed); empty aliases error.
 #[orca_tool(domain = "opnsense", verb = "pia.forwarded_port", role = "any")]
 async fn opnsense_pia_forwarded_port(
     args: PiaForwardedPortArgs,
     _ctx: &ToolCtx,
 ) -> Result<PiaForwardedPort> {
-    if let Some(alias) = &args.alias {
-        crate::validate_alias_name(alias)?;
-    }
     let cfg = resolve_config(&args.name).await?;
     let client = cfg.build_client()?;
     Ok(crate::pia_forwarded_port(&client, &cfg, args.alias.as_deref()).await?)

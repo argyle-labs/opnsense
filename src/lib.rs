@@ -680,18 +680,23 @@ pub fn validate_alias_name(name: &str) -> Result<(), OpnsenseError> {
     }
 }
 
-fn option_selected(opt: &Value) -> bool {
-    match opt.get("selected") {
-        Some(Value::Bool(b)) => *b,
-        Some(Value::Number(n)) => n.as_u64() == Some(1),
-        Some(Value::String(s)) => s == "1",
+/// OPNsense booleans arrive as `"1"`, `1`, or `true` depending on the endpoint.
+fn truthy(v: &Value) -> bool {
+    match v {
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_u64() == Some(1),
+        Value::String(s) => s == "1",
         _ => false,
     }
 }
 
+fn option_selected(opt: &Value) -> bool {
+    opt.get("selected").is_some_and(truthy)
+}
+
 /// The entries of an alias's `content` field. `getItem` renders it as an option
-/// map (`{"<v>": {"value": "<v>", "selected": 1}}`); older releases return a
-/// newline-separated string.
+/// map keyed by the raw entry (`{"<v>": {"value": "<label>", "selected": 1}}`);
+/// older releases return a newline-separated string.
 fn alias_content_entries(content: &Value) -> Vec<String> {
     match content {
         Value::String(s) => s
@@ -703,13 +708,7 @@ fn alias_content_entries(content: &Value) -> Vec<String> {
         Value::Object(map) => map
             .iter()
             .filter(|(_, opt)| option_selected(opt))
-            .map(|(key, opt)| {
-                opt.get("value")
-                    .and_then(Value::as_str)
-                    .unwrap_or(key)
-                    .trim()
-                    .to_string()
-            })
+            .map(|(key, _)| key.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect(),
         _ => Vec::new(),
@@ -740,11 +739,14 @@ struct AliasRow {
     kind: String,
     #[serde(default)]
     description: String,
+    #[serde(default)]
+    enabled: Value,
 }
 
 /// Find the PIA port alias via `GET /api/firewall/alias/searchItem`: among
-/// `port`-type aliases, those carrying the description `PIAWireguard.py`
-/// stamps, else those named `*_port`. Exactly one candidate must remain.
+/// `port`-type aliases not marked disabled, those carrying the description
+/// `PIAWireguard.py` stamps, else those whose name contains `pia`
+/// (case-insensitive) and ends in `_port`. Exactly one candidate must remain.
 /// Returns `(name, uuid)`.
 async fn discover_pia_alias(
     client: &reqwest::Client,
@@ -756,14 +758,17 @@ async fn discover_pia_alias(
     let ports: Vec<AliasRow> = result
         .rows
         .into_iter()
-        .filter(|r| r.kind == "port" || r.kind == "Port(s)")
+        // A row without `enabled` is kept; getItem rejects it later if disabled.
+        .filter(|r| {
+            (r.kind == "port" || r.kind == "Port(s)") && (r.enabled.is_null() || truthy(&r.enabled))
+        })
         .collect();
     let (stamped, rest): (Vec<AliasRow>, Vec<AliasRow>) = ports
         .into_iter()
         .partition(|r| r.description.starts_with(PIA_ALIAS_DESCRIPTION_PREFIX));
     let candidates = if stamped.is_empty() {
         rest.into_iter()
-            .filter(|r| r.name.ends_with("_port"))
+            .filter(|r| r.name.ends_with("_port") && r.name.to_ascii_lowercase().contains("pia"))
             .collect()
     } else {
         stamped
@@ -771,7 +776,7 @@ async fn discover_pia_alias(
     match <[AliasRow; 1]>::try_from(candidates) {
         Ok([one]) => Ok((one.name, one.uuid)),
         Err(none) if none.is_empty() => Err(OpnsenseError::AliasDiscovery(
-            "no port alias carries the PIAWireguard description or a `_port` name; pass --alias"
+            "no enabled port alias carries the PIAWireguard description or a `*pia*_port` name; pass --alias"
                 .to_string(),
         )),
         Err(many) => Err(OpnsenseError::AliasDiscovery(format!(
@@ -789,8 +794,7 @@ async fn discover_pia_alias(
 /// [`discover_pia_alias`]). A named alias is resolved via
 /// `GET /api/firewall/alias/getAliasUUID/<name>`; its content is read via
 /// `GET /api/firewall/alias/getItem/<uuid>`. The alias must be an enabled
-/// `port` alias holding exactly one port in 1–65535. Read-only. The caller
-/// validates `alias` with [`validate_alias_name`].
+/// `port` alias holding exactly one port in 1–65535. Read-only.
 pub async fn pia_forwarded_port(
     client: &reqwest::Client,
     cfg: &Config,
@@ -798,6 +802,7 @@ pub async fn pia_forwarded_port(
 ) -> Result<PiaForwardedPort, OpnsenseError> {
     let (alias, uuid) = match alias {
         Some(alias) => {
+            validate_alias_name(alias)?;
             let lookup: Value = get_json(
                 client,
                 &cfg.api_url(&format!("firewall/alias/getAliasUUID/{alias}")),
@@ -837,13 +842,7 @@ pub async fn pia_forwarded_port(
             kind.as_deref().unwrap_or("<missing>")
         )));
     }
-    let enabled = match body.get("enabled") {
-        Some(Value::String(s)) => s == "1",
-        Some(Value::Number(n)) => n.as_u64() == Some(1),
-        Some(Value::Bool(b)) => *b,
-        _ => false,
-    };
-    if !enabled {
+    if !body.get("enabled").is_some_and(truthy) {
         return Err(alias_err("is disabled".to_string()));
     }
 
@@ -1048,7 +1047,7 @@ mod tests {
         let rows: Vec<Value> = rows
             .iter()
             .map(|(uuid, name, kind, description)| {
-                json!({"uuid": uuid, "name": name, "type": kind, "description": description})
+                json!({"uuid": uuid, "name": name, "type": kind, "description": description, "enabled": "1"})
             })
             .collect();
         json!({ "rows": rows, "total": rows.len() }).to_string()
@@ -1119,13 +1118,14 @@ mod tests {
     }
 
     #[test]
-    fn pia_port_discovery_falls_back_to_port_suffix() {
+    fn pia_port_discovery_falls_back_to_pia_port_suffix() {
         let search = search_rows(&[
             ("9999", "vpn_port", "host", ""),
             ("8888", "web_ports", "port", ""),
-            ("1111-2222", "my_pia_port", "Port(s)", "hand-made"),
+            ("7777", "plex_port", "port", ""),
+            ("1111-2222", "my_PIA_port", "Port(s)", "hand-made"),
         ]);
-        assert_eq!(pia_port_discovered(&search).unwrap().alias, "my_pia_port");
+        assert_eq!(pia_port_discovered(&search).unwrap().alias, "my_PIA_port");
     }
 
     #[test]
@@ -1137,7 +1137,7 @@ mod tests {
         let err = pia_port_discovered(&search).unwrap_err();
         assert!(
             matches!(err, OpnsenseError::AliasDiscovery(_))
-                && err.to_string().contains("no port alias"),
+                && err.to_string().contains("no enabled port alias"),
             "{err}"
         );
         let err = pia_port_discovered(r#"{"rows":[]}"#).unwrap_err();
@@ -1160,9 +1160,51 @@ mod tests {
             "{msg}"
         );
 
-        let search = search_rows(&[("1", "a_port", "port", ""), ("2", "b_port", "port", "")]);
+        let search = search_rows(&[
+            ("1", "pia_a_port", "port", ""),
+            ("2", "pia_b_port", "port", ""),
+        ]);
         let msg = pia_port_discovered(&search).unwrap_err().to_string();
-        assert!(msg.contains("(a_port, b_port)"), "{msg}");
+        assert!(msg.contains("(pia_a_port, pia_b_port)"), "{msg}");
+    }
+
+    #[test]
+    fn pia_port_discovery_skips_disabled_aliases() {
+        let search = json!({"rows": [
+            {"uuid": "5555", "name": "pia_sweden_port", "type": "port",
+             "description": STAMP.replace("vancouver", "sweden"), "enabled": "0"},
+            {"uuid": "1111-2222", "name": "pia_vancouver_port", "type": "port",
+             "description": STAMP, "enabled": "1"},
+        ]})
+        .to_string();
+        assert_eq!(
+            pia_port_discovered(&search).unwrap().alias,
+            "pia_vancouver_port"
+        );
+    }
+
+    #[test]
+    fn pia_port_discovery_keeps_rows_without_enabled() {
+        let search = json!({"rows": [
+            {"uuid": "1111-2222", "name": "pia_vancouver_port", "type": "port",
+             "description": STAMP},
+        ]})
+        .to_string();
+        assert_eq!(
+            pia_port_discovered(&search).unwrap().alias,
+            "pia_vancouver_port"
+        );
+    }
+
+    #[test]
+    fn pia_port_rejects_invalid_alias_name_before_any_request() {
+        for bad in ["", "1abc", "pia/../x", "pia port", "a-b"] {
+            let err = pia_port_with_mock(Some(bad), &[]).unwrap_err();
+            assert!(
+                matches!(err, OpnsenseError::InvalidArgument(_)),
+                "{bad:?}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -1260,7 +1302,7 @@ mod tests {
 
     #[test]
     fn alias_name_follows_opnsense_rules() {
-        for ok in ["a", "_x9", "a_", "a__b", "Ab1", &"a".repeat(31)] {
+        for ok in ["a", "_1", "_x9", "a_", "a__b", "Ab1", &"a".repeat(31)] {
             assert!(validate_alias_name(ok).is_ok(), "{ok:?}");
         }
         for bad in [
