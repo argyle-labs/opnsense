@@ -40,8 +40,6 @@ plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main",
 # Everything else routes through the toolkit + its prelude.
 serde     = { version = "1", features = ["derive"] }
 schemars  = { version = "1", features = ["derive"] }
-anyhow    = "1"
-tracing   = "0.1"
 thiserror = "2"
 
 [dev-dependencies]
