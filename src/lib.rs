@@ -16,6 +16,8 @@
 //! the module's `service/reconfigure`.
 #![allow(clippy::disallowed_types)]
 
+pub mod authz;
+pub mod plan;
 pub mod tools;
 
 use plugin_toolkit::clap;
