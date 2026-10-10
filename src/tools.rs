@@ -24,6 +24,7 @@
 //! owning module so the change takes effect. Imports flow through `plugin_toolkit::prelude::*`.
 
 use plugin_toolkit::prelude::*;
+use plugin_toolkit::reqwest;
 
 use crate::authz::require_admin;
 use crate::plan::{Action, ReconfigurePlan, WritePlan};
@@ -236,20 +237,23 @@ async fn opnsense_hostoverride_delete(
     require_admin(ctx)?;
     let cfg = resolve_config(&args.name).await?;
     let client = cfg.build_client()?;
-    let mut plan = crate::plan::host_override_delete(
-        &client,
-        &cfg,
-        &args.hostname,
-        &args.domain,
-        args.execute,
-    )
-    .await?;
-    if !args.execute {
+    hostoverride_delete(&client, &cfg, &args).await
+}
+
+async fn hostoverride_delete(
+    client: &reqwest::Client,
+    cfg: &Config,
+    args: &HostOverrideKeyArgs,
+) -> Result<WritePlan<HostOverride>> {
+    let mut plan =
+        crate::plan::host_override_delete(client, cfg, &args.hostname, &args.domain, args.execute)
+            .await?;
+    if !args.execute || plan.action == Action::Absent {
         return Ok(plan);
     }
-    crate::delete_host_override(&client, &cfg, &args.hostname, &args.domain).await?;
+    crate::delete_host_override(client, cfg, &args.hostname, &args.domain).await?;
     plan.executed = true;
-    crate::reconfigure(&client, &cfg, Module::Unbound).await?;
+    crate::reconfigure(client, cfg, Module::Unbound).await?;
     Ok(plan)
 }
 
@@ -352,14 +356,22 @@ async fn opnsense_dot_delete(args: DotKeyArgs, ctx: &ToolCtx) -> Result<WritePla
     require_admin(ctx)?;
     let cfg = resolve_config(&args.name).await?;
     let client = cfg.build_client()?;
+    dot_delete(&client, &cfg, &args).await
+}
+
+async fn dot_delete(
+    client: &reqwest::Client,
+    cfg: &Config,
+    args: &DotKeyArgs,
+) -> Result<WritePlan<DotUpstream>> {
     let mut plan =
-        crate::plan::dot_delete(&client, &cfg, &args.server, &args.domain, args.execute).await?;
-    if !args.execute {
+        crate::plan::dot_delete(client, cfg, &args.server, &args.domain, args.execute).await?;
+    if !args.execute || plan.action == Action::Absent {
         return Ok(plan);
     }
-    crate::delete_dot(&client, &cfg, &args.server, &args.domain).await?;
+    crate::delete_dot(client, cfg, &args.server, &args.domain).await?;
     plan.executed = true;
-    crate::reconfigure(&client, &cfg, Module::Unbound).await?;
+    crate::reconfigure(client, cfg, Module::Unbound).await?;
     Ok(plan)
 }
 
@@ -472,14 +484,22 @@ async fn opnsense_reservation_delete(
     require_admin(ctx)?;
     let cfg = resolve_config(&args.name).await?;
     let client = cfg.build_client()?;
+    reservation_delete(&client, &cfg, &args).await
+}
+
+async fn reservation_delete(
+    client: &reqwest::Client,
+    cfg: &Config,
+    args: &ReservationKeyArgs,
+) -> Result<WritePlan<Reservation>> {
     let mut plan =
-        crate::plan::reservation_delete(&client, &cfg, &args.hw_address, args.execute).await?;
-    if !args.execute {
+        crate::plan::reservation_delete(client, cfg, &args.hw_address, args.execute).await?;
+    if !args.execute || plan.action == Action::Absent {
         return Ok(plan);
     }
-    crate::delete_reservation(&client, &cfg, &args.hw_address).await?;
+    crate::delete_reservation(client, cfg, &args.hw_address).await?;
     plan.executed = true;
-    crate::reconfigure(&client, &cfg, Module::Dhcp).await?;
+    crate::reconfigure(client, cfg, Module::Dhcp).await?;
     Ok(plan)
 }
 
@@ -657,5 +677,92 @@ mod tests {
                 );
             });
         }
+    }
+
+    /// Run `f` against a sink that answers every GET with an empty search and
+    /// panics on any write.
+    fn get_only<T>(
+        f: impl FnOnce(
+            reqwest::Client,
+            Config,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = T>>>,
+    ) -> T {
+        use plugin_toolkit::abi::{HttpRequest, HttpResponse};
+        let sink = Box::new(|cap: &str, op: &str| {
+            assert_eq!(cap, "http.request");
+            let req: HttpRequest = plugin_toolkit::serde_json::from_str(op).unwrap();
+            assert_eq!(
+                req.method, "GET",
+                "absent delete must not write: {}",
+                req.url
+            );
+            Ok::<String, String>(
+                plugin_toolkit::serde_json::to_string(&HttpResponse {
+                    status: 200,
+                    headers: vec![],
+                    body: br#"{"rows":[]}"#.to_vec(),
+                })
+                .unwrap(),
+            )
+        });
+        let cfg = Config::new("https://10.0.0.1", "k", "s").insecure(true);
+        plugin_toolkit::capsink::with_cap_sink(sink, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let client = cfg.build_client().unwrap();
+            rt.block_on(f(client, cfg))
+        })
+    }
+
+    fn absent_noop<T>(plan: Result<WritePlan<T>>) {
+        let plan = plan.unwrap();
+        assert_eq!(plan.action, Action::Absent);
+        assert!(!plan.executed);
+    }
+
+    #[test]
+    fn hostoverride_delete_execute_on_absent_is_a_noop() {
+        absent_noop(get_only(|c, cfg| {
+            Box::pin(async move {
+                let args = HostOverrideKeyArgs {
+                    name: "fw".into(),
+                    hostname: "h".into(),
+                    domain: "d".into(),
+                    execute: true,
+                };
+                hostoverride_delete(&c, &cfg, &args).await
+            })
+        }));
+    }
+
+    #[test]
+    fn dot_delete_execute_on_absent_is_a_noop() {
+        absent_noop(get_only(|c, cfg| {
+            Box::pin(async move {
+                let args = DotKeyArgs {
+                    name: "fw".into(),
+                    server: "9.9.9.9".into(),
+                    domain: String::new(),
+                    execute: true,
+                };
+                dot_delete(&c, &cfg, &args).await
+            })
+        }));
+    }
+
+    #[test]
+    fn reservation_delete_execute_on_absent_is_a_noop() {
+        absent_noop(get_only(|c, cfg| {
+            Box::pin(async move {
+                let args = ReservationKeyArgs {
+                    name: "fw".into(),
+                    hw_address: "aa:bb:cc:dd:ee:ff".into(),
+                    execute: true,
+                };
+                reservation_delete(&c, &cfg, &args).await
+            })
+        }));
     }
 }
