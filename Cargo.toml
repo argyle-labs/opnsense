@@ -34,7 +34,7 @@ path = "src/main.rs"
 # endpoint_resource CRUD over db_op) + `delegated-http` are all it needs. The
 # `service` domain is a non-optional toolkit dep and `.service()` on the builder
 # is ungated, so the service facet compiles under this same feature set.
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", default-features = false, features = ["tools", "db", "delegated-http"] }
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", package = "orca-plugin-toolkit", default-features = false, features = ["tools", "db", "delegated-http"] }
 
 # Light, genuinely-external deps the plugin's own source names at the crate root.
 # Everything else routes through the toolkit + its prelude.
