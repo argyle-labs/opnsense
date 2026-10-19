@@ -44,6 +44,7 @@ use crate::{
 #[endpoint_resource(plugin = "opnsense")]
 pub struct OpnsenseEndpoint {
     pub name: String,
+    #[secret]
     pub api_key: String,
     #[secret]
     pub api_secret: String,
@@ -55,19 +56,18 @@ pub struct OpnsenseEndpoint {
 
 /// Resolve a registered endpoint into a ready [`Config`]: the first reachable
 /// base URL (`resolve_reachable` over the endpoint's `routes` fallback list)
-/// plus the secure-first API secret.
+/// plus the API key and secret from the secrets store.
 pub(crate) async fn resolve_config(name: &str) -> Result<Config> {
     let row = endpoint_db::require(name)?;
-    // Prefer the abstract secrets domain (`opnsense.<endpoint>.api_secret`),
-    // falling back to a legacy plaintext column value only if the domain has none.
-    let api_secret = plugin_toolkit::secrets::resolve_scoped(
-        "opnsense",
-        name,
-        "api_secret",
-        (!row.api_secret.is_empty()).then_some(row.api_secret.as_str()),
-    )?;
+    let api_key = plugin_toolkit::secrets::resolve_scoped("opnsense", name, "api_key")?;
+    let api_secret = plugin_toolkit::secrets::resolve_scoped("opnsense", name, "api_secret")?;
     let base_url = route::resolve_reachable(name, &row.routes, row.insecure).await?;
-    Ok(Config::new(base_url, row.api_key, api_secret).insecure(row.insecure))
+    Ok(Config {
+        base_url,
+        api_key,
+        api_secret,
+        insecure: row.insecure,
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
