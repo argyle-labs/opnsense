@@ -22,6 +22,7 @@ pub mod tools;
 
 use plugin_toolkit::clap;
 use plugin_toolkit::reqwest;
+use plugin_toolkit::secrets::Secret;
 use plugin_toolkit::serde_json::{Value, json};
 use plugin_toolkit::service::{
     BoxFuture, Routes, Runtime, ServiceBackend, ServiceError, ServiceStatus, WorkloadSpec,
@@ -262,9 +263,9 @@ pub struct Config {
     /// `/api/<module>/<controller>/<command>` path is joined onto this.
     pub base_url: String,
     /// OPNsense API key — the username half of the Basic credential.
-    pub api_key: String,
+    pub api_key: Secret<String>,
     /// OPNsense API secret — the password half of the Basic credential.
-    pub api_secret: String,
+    pub api_secret: Secret<String>,
     /// Skip TLS verification (self-signed appliance certs).
     pub insecure: bool,
 }
@@ -277,8 +278,8 @@ impl Config {
     ) -> Self {
         Self {
             base_url: base_url.into(),
-            api_key: api_key.into(),
-            api_secret: api_secret.into(),
+            api_key: Secret::new(api_key.into()),
+            api_secret: Secret::new(api_secret.into()),
             insecure: false,
         }
     }
@@ -290,7 +291,11 @@ impl Config {
 
     /// `Basic <base64(key:secret)>` — OPNsense's API auth scheme.
     fn auth_header_value(&self) -> String {
-        let raw = format!("{}:{}", self.api_key, self.api_secret);
+        let raw = format!(
+            "{}:{}",
+            self.api_key.expose_secret(),
+            self.api_secret.expose_secret()
+        );
         format!("Basic {}", base64_encode(raw.as_bytes()))
     }
 
