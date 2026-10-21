@@ -18,6 +18,8 @@
 //!   - `opnsense.dhcp.reservation.delete`       delete the reservation for a MAC
 //!   - `opnsense.pia.forwarded_port`            read the PIA forwarded port from its alias
 //!   - `opnsense.wireguard.handshakes`          per-peer handshake age, flagging stale tunnels
+//!   - `opnsense.netflow.health`                NetFlow capture/collection + flowd service state
+//!   - `opnsense.netflow.repair`                re-enable collection and restart stopped flowd services
 //!
 //! Every mutating verb needs the admin role (also for its dry run) and only
 //! writes with `--execute`; without it the verb returns the plan. A `set` or
@@ -30,8 +32,8 @@ use plugin_toolkit::reqwest;
 use crate::authz::require_admin;
 use crate::plan::{Action, ReconfigurePlan, WritePlan};
 use crate::{
-    Config, DotUpstream, HostOverride, Module, PiaForwardedPort, Reservation, ServiceState,
-    WireguardHandshakeReport,
+    Config, DotUpstream, HostOverride, Module, NetflowHealth, NetflowRepair, PiaForwardedPort,
+    Reservation, ServiceState, WireguardHandshakeReport,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -562,6 +564,29 @@ async fn opnsense_wireguard_handshakes(
         .map(|d| d.as_secs())
         .unwrap_or_default();
     Ok(crate::wireguard_handshakes(&client, &cfg, args.stale_after_secs, now).await?)
+}
+
+/// Report NetFlow capture and local collection state plus flowd/flowd_aggregate liveness.
+#[orca_tool(domain = "opnsense", verb = "netflow.health", role = "any")]
+async fn opnsense_netflow_health(args: EndpointArgs, _ctx: &ToolCtx) -> Result<NetflowHealth> {
+    let cfg = resolve_config(&args.name).await?;
+    let client = cfg.build_client()?;
+    Ok(crate::read_netflow_health(&client, &cfg).await?)
+}
+
+/// [MUTATES STATE] Re-enable NetFlow local collection when disabled and restart
+/// stopped flowd/flowd_aggregate services. `dryRun` previews.
+#[orca_tool(
+    domain = "opnsense",
+    verb = "netflow.repair",
+    role = "admin",
+    execute_gated = true
+)]
+async fn opnsense_netflow_repair(args: EndpointArgs, ctx: &ToolCtx) -> Result<NetflowRepair> {
+    require_admin(ctx)?;
+    let cfg = resolve_config(&args.name).await?;
+    let client = cfg.build_client()?;
+    Ok(crate::repair_netflow(&client, &cfg).await?)
 }
 
 #[cfg(test)]
