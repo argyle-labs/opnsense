@@ -955,6 +955,123 @@ pub async fn wireguard_handshakes(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// NetFlow / Insight
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub const NETFLOW_SERVICES: [&str; 2] = ["flowd", "flowd_aggregate"];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct NetflowServiceState {
+    pub id: String,
+    pub present: bool,
+    pub running: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct NetflowHealth {
+    pub capture_enabled: bool,
+    pub local_collection_enabled: bool,
+    pub services: Vec<NetflowServiceState>,
+    pub healthy: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct NetflowRepair {
+    pub before: NetflowHealth,
+    pub actions: Vec<String>,
+    pub after: NetflowHealth,
+}
+
+pub fn netflow_health(enabled: &Value, services: &[Value]) -> NetflowHealth {
+    let capture_enabled = enabled.get("netflow").is_some_and(truthy);
+    let local_collection_enabled = enabled.get("local").is_some_and(truthy);
+    let services: Vec<NetflowServiceState> = NETFLOW_SERVICES
+        .iter()
+        .map(|id| {
+            let row = services
+                .iter()
+                .find(|r| r.get("id").and_then(Value::as_str) == Some(*id));
+            NetflowServiceState {
+                id: id.to_string(),
+                present: row.is_some(),
+                running: row.and_then(|r| r.get("running")).is_some_and(truthy),
+            }
+        })
+        .collect();
+    let healthy = capture_enabled && local_collection_enabled && services.iter().all(|s| s.running);
+    NetflowHealth {
+        capture_enabled,
+        local_collection_enabled,
+        services,
+        healthy,
+    }
+}
+
+pub async fn read_netflow_health(
+    client: &reqwest::Client,
+    cfg: &Config,
+) -> Result<NetflowHealth, OpnsenseError> {
+    let enabled: Value = get_json(client, &cfg.api_url("diagnostics/netflow/isEnabled")).await?;
+    let services: SearchResult<Value> = get_json(
+        client,
+        &cfg.api_url("core/service/search?searchPhrase=flowd&rowCount=-1"),
+    )
+    .await?;
+    Ok(netflow_health(&enabled, &services.rows))
+}
+
+pub async fn repair_netflow(
+    client: &reqwest::Client,
+    cfg: &Config,
+) -> Result<NetflowRepair, OpnsenseError> {
+    let before = read_netflow_health(client, cfg).await?;
+    let mut actions = Vec::new();
+    if !before.local_collection_enabled {
+        post_write(
+            client,
+            &cfg.api_url("diagnostics/netflow/setconfig"),
+            &json!({"netflow": {"collect": {"enable": "1"}}}),
+        )
+        .await?;
+        post_json(
+            client,
+            &cfg.api_url("diagnostics/netflow/reconfigure"),
+            &json!({}),
+        )
+        .await?;
+        actions.push("enabled local collection".to_string());
+    }
+    let after_config = if actions.is_empty() {
+        before.clone()
+    } else {
+        read_netflow_health(client, cfg).await?
+    };
+    for svc in after_config
+        .services
+        .iter()
+        .filter(|s| s.present && !s.running)
+    {
+        post_json(
+            client,
+            &cfg.api_url(&format!("core/service/restart/{}", svc.id)),
+            &json!({}),
+        )
+        .await?;
+        actions.push(format!("restarted {}", svc.id));
+    }
+    let after = if actions.is_empty() {
+        before.clone()
+    } else {
+        read_netflow_health(client, cfg).await?
+    };
+    Ok(NetflowRepair {
+        before,
+        actions,
+        after,
+    })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Apply / status
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1432,5 +1549,28 @@ mod tests {
         assert_eq!(r.peers[2].latest_handshake, None);
         assert_eq!(r.peers[2].endpoint, None);
         assert!(r.peers[2].stale);
+    }
+
+    #[test]
+    fn netflow_health_reports_disabled_and_stopped() {
+        let services = vec![
+            json!({"id":"flowd","running":1}),
+            json!({"id":"flowd_aggregate","running":0}),
+        ];
+        let h = netflow_health(&json!({"netflow":1,"local":"0"}), &services);
+        assert!(h.capture_enabled);
+        assert!(!h.local_collection_enabled);
+        assert!(h.services[0].running);
+        assert!(h.services[1].present && !h.services[1].running);
+        assert!(!h.healthy);
+
+        let running = vec![
+            json!({"id":"flowd","running":"1"}),
+            json!({"id":"flowd_aggregate","running":1}),
+        ];
+        assert!(netflow_health(&json!({"netflow":"1","local":1}), &running).healthy);
+        let missing = netflow_health(&json!({"netflow":1,"local":1}), &[]);
+        assert!(!missing.services[0].present);
+        assert!(!missing.healthy);
     }
 }
