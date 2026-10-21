@@ -874,6 +874,87 @@ pub async fn pia_forwarded_port(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// WireGuard handshakes
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WireguardPeerHandshake {
+    pub interface: String,
+    pub peer: String,
+    pub public_key: String,
+    pub endpoint: Option<String>,
+    pub latest_handshake: Option<u64>,
+    pub handshake_age_secs: Option<u64>,
+    pub stale: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WireguardHandshakeReport {
+    pub stale_after_secs: u64,
+    pub peers: Vec<WireguardPeerHandshake>,
+    pub stale_count: usize,
+}
+
+fn value_str(row: &Value, key: &str) -> Option<String> {
+    match row.get(key)? {
+        Value::String(s) if !s.is_empty() => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn value_u64(row: &Value, key: &str) -> Option<u64> {
+    match row.get(key)? {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+pub fn handshake_report(
+    rows: &[Value],
+    now: u64,
+    stale_after_secs: u64,
+) -> WireguardHandshakeReport {
+    let peers: Vec<WireguardPeerHandshake> = rows
+        .iter()
+        .filter(|r| r.get("type").and_then(Value::as_str) == Some("peer"))
+        .map(|r| {
+            let latest_handshake = value_u64(r, "latest-handshake").filter(|t| *t > 0);
+            let handshake_age_secs = latest_handshake.map(|t| now.saturating_sub(t));
+            WireguardPeerHandshake {
+                interface: value_str(r, "ifname")
+                    .or_else(|| value_str(r, "if"))
+                    .unwrap_or_default(),
+                peer: value_str(r, "name").unwrap_or_default(),
+                public_key: value_str(r, "public-key").unwrap_or_default(),
+                endpoint: value_str(r, "endpoint").filter(|e| e != "(none)"),
+                latest_handshake,
+                handshake_age_secs,
+                stale: handshake_age_secs.is_none_or(|age| age > stale_after_secs),
+            }
+        })
+        .collect();
+    let stale_count = peers.iter().filter(|p| p.stale).count();
+    WireguardHandshakeReport {
+        stale_after_secs,
+        peers,
+        stale_count,
+    }
+}
+
+pub async fn wireguard_handshakes(
+    client: &reqwest::Client,
+    cfg: &Config,
+    stale_after_secs: u64,
+    now: u64,
+) -> Result<WireguardHandshakeReport, OpnsenseError> {
+    let url = cfg.api_url("wireguard/service/show");
+    let result: SearchResult<Value> = get_json(client, &url).await?;
+    Ok(handshake_report(&result.rows, now, stale_after_secs))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Apply / status
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1330,5 +1411,26 @@ mod tests {
         assert_eq!(row.uuid.as_deref(), Some("abc"));
         assert_eq!(row.hostname, "gitea");
         assert_eq!(row.server, "10.0.0.16");
+    }
+
+    #[test]
+    fn handshake_report_flags_stale_and_missing_handshakes() {
+        let rows = vec![
+            json!({"type":"interface","ifname":"wg0"}),
+            json!({"type":"peer","ifname":"wg0","name":"fresh","public-key":"a","endpoint":"10.0.0.2:51820","latest-handshake":990}),
+            json!({"type":"peer","if":"wg1","name":"old","public-key":"b","latest-handshake":"100"}),
+            json!({"type":"peer","ifname":"wg0","name":"never","public-key":"c","endpoint":"(none)","latest-handshake":0}),
+        ];
+        let r = handshake_report(&rows, 1000, 180);
+        assert_eq!(r.peers.len(), 3);
+        assert_eq!(r.stale_count, 2);
+        assert!(!r.peers[0].stale);
+        assert_eq!(r.peers[0].handshake_age_secs, Some(10));
+        assert_eq!(r.peers[1].interface, "wg1");
+        assert_eq!(r.peers[1].handshake_age_secs, Some(900));
+        assert!(r.peers[1].stale);
+        assert_eq!(r.peers[2].latest_handshake, None);
+        assert_eq!(r.peers[2].endpoint, None);
+        assert!(r.peers[2].stale);
     }
 }
