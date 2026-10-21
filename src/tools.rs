@@ -17,6 +17,7 @@
 //!   - `opnsense.dhcp.reservation.set`          idempotent upsert of a MAC->IP reservation
 //!   - `opnsense.dhcp.reservation.delete`       delete the reservation for a MAC
 //!   - `opnsense.pia.forwarded_port`            read the PIA forwarded port from its alias
+//!   - `opnsense.wireguard.handshakes`          per-peer handshake age, flagging stale tunnels
 //!
 //! Every mutating verb needs the admin role (also for its dry run) and only
 //! writes with `--execute`; without it the verb returns the plan. A `set` or
@@ -30,6 +31,7 @@ use crate::authz::require_admin;
 use crate::plan::{Action, ReconfigurePlan, WritePlan};
 use crate::{
     Config, DotUpstream, HostOverride, Module, PiaForwardedPort, Reservation, ServiceState,
+    WireguardHandshakeReport,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -530,6 +532,36 @@ async fn opnsense_pia_forwarded_port(
     let cfg = resolve_config(&args.name).await?;
     let client = cfg.build_client()?;
     Ok(crate::pia_forwarded_port(&client, &cfg, args.alias.as_deref()).await?)
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct WireguardHandshakesArgs {
+    /// Registered opnsense endpoint name.
+    #[arg(long)]
+    pub name: String,
+    /// Seconds since the last handshake after which a peer counts as stale.
+    #[arg(long, default_value_t = 180)]
+    #[serde(default = "default_stale_after_secs")]
+    pub stale_after_secs: u64,
+}
+
+fn default_stale_after_secs() -> u64 {
+    180
+}
+
+/// Report each WireGuard peer's last-handshake age and flag stale tunnels.
+#[orca_tool(domain = "opnsense", verb = "wireguard.handshakes", role = "any")]
+async fn opnsense_wireguard_handshakes(
+    args: WireguardHandshakesArgs,
+    _ctx: &ToolCtx,
+) -> Result<WireguardHandshakeReport> {
+    let cfg = resolve_config(&args.name).await?;
+    let client = cfg.build_client()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    Ok(crate::wireguard_handshakes(&client, &cfg, args.stale_after_secs, now).await?)
 }
 
 #[cfg(test)]
