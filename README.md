@@ -80,9 +80,8 @@ orca service.configure opnsense   # apply config via the opnsense API
 
 Safety:
 
-- A config savepoint is taken before each write. After apply, orca checks the API still answers; if not, it calls `firewall/d_nat/revert/<savepoint>` and reports whether the revert worked.
-- OPNsense's own rollback timer only restores filter rules, never NAT, so it is not used and `rollback_protected` is always `false`. OPNsense 26.7+ has no d_nat savepoint/revert, so there is no revert there.
-- Only `wan` counts as WAN. Any other interface (`opt*` included) needs `allow_unprotected`.
+- OPNsense has no rollback for NAT (its savepoint/rollback timer restores filter rules only), so orca compensates itself and `rollback_protected` is always `false`. Before changing or deleting a rule it snapshots it with `get_rule`. If apply or the post-apply health check fails, orca undoes the write — deletes a created rule, restores an updated rule from the snapshot, or re-adds a deleted one — re-applies, and reports whether that worked. The undo needs the API reachable; if the change cut orca off, it fails and says so.
+- Only an exact `wan` counts as WAN. If the current or desired interface is anything else (`opt*` and multi-interface rules included), `allow_unprotected` is required.
 - On non-WAN interfaces, forwards touching 22/80/443 (plus the endpoint's `management_ports`, comma-separated) are refused unless the destination is a literal host address that is not a firewall interface address.
 
 ## Layout

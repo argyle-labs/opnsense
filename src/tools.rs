@@ -21,11 +21,12 @@
 //!   - `opnsense.netflow.health`                NetFlow capture/collection + flowd service state
 //!   - `opnsense.netflow.repair`                re-enable collection and restart stopped flowd services
 //!   - `opnsense.nat.forward.list`              list destination NAT port forwards
-//!   - `opnsense.nat.forward.set`               upsert a port forward by description; reverts on a failed health check
-//!   - `opnsense.nat.forward.delete`            delete a port forward by description; reverts on a failed health check
+//!   - `opnsense.nat.forward.set`               upsert a port forward by description; undoes the write on a failed apply/health check
+//!   - `opnsense.nat.forward.delete`            delete a port forward by description; undoes the write on a failed apply/health check
 //!
 //! Every mutating verb needs the admin role (also for its dry run) and only
-//! writes with `--execute`; without it the verb returns the plan. A `set` or
+//! writes with `--execute`, except the execute-gated `nat.forward.*` verbs,
+//! which apply unless the caller passes `dryRun`. A `set` or
 //! `delete` that changes something is followed by a `reconfigure` of the
 //! owning module so the change takes effect. Imports flow through `plugin_toolkit::prelude::*`.
 
@@ -678,12 +679,14 @@ fn default_filter_rule() -> FilterRule {
 }
 
 /// [MUTATES STATE] Upsert an orca-owned (`orca:`-prefixed) port-forward keyed
-/// by description. A savepoint is taken before the write; after apply orca
-/// checks the API still answers and reverts to the savepoint if not. There is
-/// no appliance-side rollback timer for NAT, so `rollback_protected` is always
-/// false, and OPNsense 26.7+ has no d_nat savepoint at all (no revert). An
-/// unchanged rule is left alone. Only `wan` is WAN: any other interface (`opt*`
-/// included) needs `allow_unprotected`, and management ports (22/80/443 plus
+/// by description. An existing rule is snapshotted (`get_rule`) before it is
+/// changed; if apply or the post-apply health check fails, orca undoes the
+/// write (delete the created rule, or restore the snapshot) and re-applies,
+/// reporting whether that worked. OPNsense has no rollback for NAT, so
+/// `rollback_protected` is always false. An unchanged rule is left alone. Only
+/// an exact `wan` is WAN: if the current or desired interface is anything else
+/// (`opt*` and multi-interface rules included) `allow_unprotected` is
+/// required, and management ports (22/80/443 plus
 /// the endpoint's `management_ports`) may only forward to a literal host that
 /// is not a firewall address. `dryRun` previews.
 #[orca_tool(
@@ -743,9 +746,10 @@ pub struct NatForwardKeyArgs {
 }
 
 /// [MUTATES STATE] Delete the orca-owned port-forward with this description,
-/// with the same savepoint + health-check revert as `nat.forward.set` (no
-/// revert on OPNsense 26.7+). A non-WAN rule (anything but `wan`, `opt*`
-/// included) needs `allow_unprotected`. `dryRun` previews.
+/// snapshotting it first and re-adding the snapshot if apply or the health
+/// check fails. A rule on any interface but exactly `wan` (`opt*` and
+/// multi-interface included) needs `allow_unprotected`. An absent rule is a
+/// no-op. `dryRun` previews.
 #[orca_tool(
     domain = "opnsense",
     verb = "nat.forward.delete",

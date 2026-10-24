@@ -138,7 +138,6 @@ impl PortForward {
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ApplyResult {
-    pub revision: Option<String>,
     pub rollback_protected: bool,
     pub status: Value,
 }
@@ -412,26 +411,7 @@ fn rule_uuid(rule: &PortForward) -> Result<&str, OpnsenseError> {
         })
 }
 
-async fn savepoint(
-    client: &reqwest::Client,
-    cfg: &Config,
-) -> Result<Option<String>, OpnsenseError> {
-    match post_json(client, &cfg.api_url("firewall/d_nat/savepoint"), &json!({})).await {
-        Ok(v) => v
-            .get("revision")
-            .and_then(Value::as_str)
-            .filter(|r| !r.is_empty() && r.bytes().all(|c| c.is_ascii_digit() || c == b'.'))
-            .map(|r| Some(r.to_string()))
-            .ok_or_else(|| {
-                OpnsenseError::Malformed(format!("savepoint returned no revision: {v}"))
-            }),
-        Err(OpnsenseError::Api { status: 404, .. }) => Ok(None),
-        Err(e) => Err(e),
-    }
-}
-
 const APPLIED: &str = "OK";
-const REVERTED: &str = "ok";
 
 fn status_is(v: &Value, expected: &str) -> bool {
     v.get("status")
@@ -456,87 +436,132 @@ async fn post_ok(
     }
 }
 
-async fn revert(client: &reqwest::Client, cfg: &Config, revision: &str) -> String {
-    match post_ok(
-        client,
-        cfg,
-        &format!("firewall/d_nat/revert/{revision}"),
-        REVERTED,
-    )
-    .await
-    {
-        Ok(_) => format!("reverted to savepoint {revision}"),
-        Err(e) => format!("NOT reverted to savepoint {revision}: {e}"),
-    }
-}
+const SNAPSHOT_SKIP: [&str; 5] = ["created", "updated", "audit", "categories", "address"];
 
-async fn revert_if_saved(
-    client: &reqwest::Client,
-    cfg: &Config,
-    revision: &Option<String>,
-) -> String {
-    match revision {
-        Some(rev) => revert(client, cfg, rev).await,
-        None => "appliance has no d_nat savepoint; NOT reverted".to_string(),
-    }
-}
-
-async fn guarded_write(
-    client: &reqwest::Client,
-    cfg: &Config,
-    interface: &str,
-    allow_unprotected: bool,
-    write: impl AsyncFnOnce() -> Result<Option<String>, OpnsenseError>,
-) -> Result<(Option<String>, ApplyResult), OpnsenseError> {
-    if interface != "wan" && !allow_unprotected {
-        return Err(invalid(format!(
-            "NAT changes have no automatic rollback; refusing a change on non-WAN interface {interface:?} without allow_unprotected"
-        )));
-    }
-    let revision = savepoint(client, cfg).await?;
-    let uuid = match write().await {
-        Ok(uuid) => uuid,
-        Err(e) => {
-            return Err(match &revision {
-                Some(rev) => {
-                    OpnsenseError::Transport(format!("{e}; {}", revert(client, cfg, rev).await))
-                }
-                None => e,
-            });
-        }
+fn flatten_rule(v: &Value) -> Value {
+    let Some(obj) = v.as_object() else {
+        return v.clone();
     };
+    let is_options = !obj.is_empty()
+        && obj
+            .values()
+            .all(|o| o.as_object().is_some_and(|o| o.contains_key("selected")));
+    if is_options {
+        let selected: Vec<&str> = obj
+            .iter()
+            .filter(|(_, o)| crate::truthy(&o["selected"]))
+            .map(|(k, _)| k.as_str())
+            .collect();
+        return Value::String(selected.join(","));
+    }
+    Value::Object(
+        obj.iter()
+            .filter(|(k, _)| !SNAPSHOT_SKIP.contains(&k.as_str()))
+            .map(|(k, v)| (k.clone(), flatten_rule(v)))
+            .collect(),
+    )
+}
+
+async fn snapshot(
+    client: &reqwest::Client,
+    cfg: &Config,
+    uuid: &str,
+) -> Result<Value, OpnsenseError> {
+    let raw: Value = get_json(
+        client,
+        &cfg.api_url(&format!("firewall/d_nat/get_rule/{uuid}")),
+    )
+    .await?;
+    let rule = raw.get("rule").ok_or_else(|| {
+        OpnsenseError::Malformed(format!("get_rule/{uuid} returned no rule: {raw}"))
+    })?;
+    Ok(json!({ "rule": flatten_rule(rule) }))
+}
+
+enum Undo {
+    Delete(String),
+    Restore(String, Value),
+    Readd(Value),
+}
+
+async fn compensate(client: &reqwest::Client, cfg: &Config, undo: Undo) -> String {
+    let (what, write) = match &undo {
+        Undo::Delete(uuid) => (
+            format!("deleted created rule {uuid}"),
+            post_write(
+                client,
+                &cfg.api_url(&format!("firewall/d_nat/del_rule/{uuid}")),
+                &json!({}),
+            )
+            .await,
+        ),
+        Undo::Restore(uuid, body) => (
+            format!("restored rule {uuid} from snapshot"),
+            post_write(
+                client,
+                &cfg.api_url(&format!("firewall/d_nat/set_rule/{uuid}")),
+                body,
+            )
+            .await,
+        ),
+        Undo::Readd(body) => (
+            "re-added deleted rule from snapshot".to_string(),
+            post_write(client, &cfg.api_url("firewall/d_nat/add_rule"), body).await,
+        ),
+    };
+    if let Err(e) = write {
+        return format!("compensation FAILED ({what}): {e}");
+    }
+    match post_ok(client, cfg, "firewall/d_nat/apply", APPLIED).await {
+        Ok(_) => format!("compensated: {what} and re-applied"),
+        Err(e) => format!("compensation written but re-apply FAILED ({what}): {e}"),
+    }
+}
+
+fn require_wan(interfaces: &[&str], allow_unprotected: bool) -> Result<(), OpnsenseError> {
+    match interfaces.iter().find(|i| **i != "wan") {
+        Some(i) if !allow_unprotected => Err(invalid(format!(
+            "NAT changes have no automatic rollback; refusing a change touching non-WAN interface {i:?} without allow_unprotected"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+async fn apply_and_verify(
+    client: &reqwest::Client,
+    cfg: &Config,
+    uuid: &str,
+    undo: Undo,
+) -> Result<ApplyResult, OpnsenseError> {
     let status = match post_ok(client, cfg, "firewall/d_nat/apply", APPLIED).await {
         Ok(s) => s,
         Err(e) => {
             return Err(OpnsenseError::NotApplied {
-                uuid: uuid.unwrap_or_default(),
-                reason: format!("{e}; {}", revert_if_saved(client, cfg, &revision).await),
+                uuid: uuid.to_string(),
+                reason: format!("{e}; {}", compensate(client, cfg, undo).await),
             });
         }
     };
     if let Err(e) = list_port_forwards(client, cfg).await {
         return Err(OpnsenseError::Unhealthy {
-            uuid: uuid.unwrap_or_default(),
-            reason: format!("{e}; {}", revert_if_saved(client, cfg, &revision).await),
+            uuid: uuid.to_string(),
+            reason: format!("{e}; {}", compensate(client, cfg, undo).await),
         });
     }
-    Ok((
-        uuid,
-        ApplyResult {
-            revision,
-            rollback_protected: false,
-            status,
-        },
-    ))
+    Ok(ApplyResult {
+        rollback_protected: false,
+        status,
+    })
 }
 
 const APPLY_STEPS: [&str; 2] = [
     "POST firewall/d_nat/apply",
-    "GET firewall/d_nat/search_rule (health; on failure POST firewall/d_nat/revert/<savepoint>)",
+    "GET firewall/d_nat/search_rule (health; on failure undo the write and re-apply)",
 ];
 
-fn steps(write: String) -> Vec<String> {
-    let mut s = vec!["POST firewall/d_nat/savepoint".to_string(), write];
+fn steps(pre: Option<String>, write: String) -> Vec<String> {
+    let mut s: Vec<String> = pre.into_iter().collect();
+    s.push(write);
     s.extend(APPLY_STEPS.iter().map(|x| x.to_string()));
     s
 }
@@ -559,11 +584,20 @@ pub async fn plan_set(
         Some(c) if c.same_settings(&desired) && c.description == desired.description => {
             (Action::Unchanged, Vec::new())
         }
-        Some(c) => (
-            Action::Update,
-            steps(format!("POST firewall/d_nat/set_rule/{}", rule_uuid(c)?)),
+        Some(c) => {
+            let uuid = rule_uuid(c)?;
+            (
+                Action::Update,
+                steps(
+                    Some(format!("GET firewall/d_nat/get_rule/{uuid} (snapshot)")),
+                    format!("POST firewall/d_nat/set_rule/{uuid}"),
+                ),
+            )
+        }
+        None => (
+            Action::Create,
+            steps(None, "POST firewall/d_nat/add_rule".into()),
         ),
-        None => (Action::Create, steps("POST firewall/d_nat/add_rule".into())),
     };
     Ok(NatWritePlan {
         plan: WritePlan {
@@ -599,34 +633,36 @@ pub async fn set_port_forward(
     let Some(desired) = out.plan.desired.clone() else {
         return Ok(out);
     };
-    let existing = out
-        .plan
-        .current
-        .as_ref()
-        .map(rule_uuid)
-        .transpose()?
-        .map(str::to_string);
+    let mut interfaces: Vec<&str> = desired.interface.split(',').collect();
+    if let Some(c) = &out.plan.current {
+        interfaces.extend(c.interface.split(','));
+    }
+    require_wan(&interfaces, opts.allow_unprotected)?;
     let body = desired.body();
-    let (uuid, applied) = guarded_write(
-        client,
-        cfg,
-        &desired.interface,
-        opts.allow_unprotected,
-        async || match &existing {
-            Some(uuid) => {
-                post_write(
-                    client,
-                    &cfg.api_url(&format!("firewall/d_nat/set_rule/{uuid}")),
-                    &body,
-                )
-                .await?;
-                Ok(Some(uuid.clone()))
-            }
-            None => post_write(client, &cfg.api_url("firewall/d_nat/add_rule"), &body).await,
-        },
-    )
-    .await?;
-    out.plan.desired = Some(PortForward { uuid, ..desired });
+    let (uuid, undo) = match &out.plan.current {
+        Some(c) => {
+            let uuid = rule_uuid(c)?.to_string();
+            let before = snapshot(client, cfg, &uuid).await?;
+            post_write(
+                client,
+                &cfg.api_url(&format!("firewall/d_nat/set_rule/{uuid}")),
+                &body,
+            )
+            .await?;
+            (uuid.clone(), Undo::Restore(uuid, before))
+        }
+        None => {
+            let uuid = post_write(client, &cfg.api_url("firewall/d_nat/add_rule"), &body)
+                .await?
+                .ok_or_else(|| OpnsenseError::Malformed("add_rule returned no uuid".into()))?;
+            (uuid.clone(), Undo::Delete(uuid))
+        }
+    };
+    let applied = apply_and_verify(client, cfg, &uuid, undo).await?;
+    out.plan.desired = Some(PortForward {
+        uuid: Some(uuid),
+        ..desired
+    });
     out.plan.executed = true;
     out.apply = Some(applied);
     Ok(out)
@@ -642,10 +678,16 @@ pub async fn plan_delete(
     validate_description(description)?;
     let current = find_owned(client, cfg, description, adopt).await?;
     let (action, steps) = match &current {
-        Some(c) => (
-            Action::Delete,
-            steps(format!("POST firewall/d_nat/del_rule/{}", rule_uuid(c)?)),
-        ),
+        Some(c) => {
+            let uuid = rule_uuid(c)?;
+            (
+                Action::Delete,
+                steps(
+                    Some(format!("GET firewall/d_nat/get_rule/{uuid} (snapshot)")),
+                    format!("POST firewall/d_nat/del_rule/{uuid}"),
+                ),
+            )
+        }
         None => (Action::Absent, Vec::new()),
     };
     Ok(NatWritePlan {
@@ -668,32 +710,20 @@ pub async fn delete_port_forward(
     opts: WriteOptions,
 ) -> Result<NatWritePlan, OpnsenseError> {
     let mut out = plan_delete(client, cfg, description, opts.adopt, opts.execute).await?;
-    if !opts.execute {
+    let Some(current) = out.plan.current.clone().filter(|_| opts.execute) else {
         return Ok(out);
-    }
-    let Some(current) = out.plan.current.clone() else {
-        return Err(OpnsenseError::NotFound {
-            kind: "port forward",
-            selector: description.to_string(),
-        });
     };
+    let interfaces: Vec<&str> = current.interface.split(',').collect();
+    require_wan(&interfaces, opts.allow_unprotected)?;
     let uuid = rule_uuid(&current)?.to_string();
-    let (_, applied) = guarded_write(
+    let before = snapshot(client, cfg, &uuid).await?;
+    post_write(
         client,
-        cfg,
-        &current.interface,
-        opts.allow_unprotected,
-        async || {
-            post_write(
-                client,
-                &cfg.api_url(&format!("firewall/d_nat/del_rule/{uuid}")),
-                &json!({}),
-            )
-            .await?;
-            Ok(Some(uuid.clone()))
-        },
+        &cfg.api_url(&format!("firewall/d_nat/del_rule/{uuid}")),
+        &json!({}),
     )
     .await?;
+    let applied = apply_and_verify(client, cfg, &uuid, Undo::Readd(before)).await?;
     out.plan.executed = true;
     out.apply = Some(applied);
     Ok(out)
@@ -753,45 +783,6 @@ mod tests {
         (result, calls)
     }
 
-    fn with_stateful_mock<T>(
-        respond: impl Fn(&str, &str, usize) -> (u16, String) + Send + Sync + 'static,
-        f: impl AsyncFnOnce(&reqwest::Client, &Config) -> Result<T, OpnsenseError>,
-    ) -> (Result<T, OpnsenseError>, Vec<String>) {
-        let calls: Calls = Arc::default();
-        let log = calls.clone();
-        let sink = Box::new(move |_cap: &str, op: &str| {
-            let req: HttpRequest = plugin_toolkit::serde_json::from_str(op).unwrap();
-            let mut log = log.lock().unwrap();
-            let seen = log
-                .iter()
-                .filter(|(m, u, _)| *m == req.method && *u == req.url)
-                .count();
-            log.push((req.method.clone(), req.url.clone(), String::new()));
-            let (status, body) = respond(&req.method, &req.url, seen);
-            Ok::<String, String>(
-                plugin_toolkit::serde_json::to_string(&HttpResponse {
-                    status,
-                    headers: vec![],
-                    body: body.into_bytes(),
-                })
-                .unwrap(),
-            )
-        });
-        let cfg = Config::new("https://10.0.0.1", "k", "s").insecure(true);
-        let result = plugin_toolkit::capsink::with_cap_sink(sink, || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async {
-                let client = cfg.build_client()?;
-                f(&client, &cfg).await
-            })
-        });
-        let calls = calls.lock().unwrap().clone();
-        (result, paths(&calls))
-    }
-
     const SEARCH: &str = "/firewall/d_nat/search_rule?current=1&rowCount=-1";
     const UUID: &str = "aaaa-1111";
 
@@ -828,24 +819,17 @@ mod tests {
         }
     }
 
-    const REV: &str = "1729700000.12";
-    const SAVEPOINT: &str = r#"{"status":"ok","retention":"60","revision":"1729700000.12"}"#;
     const SAVED: &str = r#"{"result":"saved","uuid":"bbbb-2222"}"#;
+    const UPDATED: &str = r#"{"result":"saved"}"#;
+    const DELETED: &str = r#"{"result":"deleted"}"#;
     const OK: &str = "{\"status\":\"OK\\n\\n\"}";
     const OWNED: &str = "orca:orca https";
+    const GET_RULE: &str = r#"{"rule":{"sequence":"10","disabled":"0","interface":{"wan":{"value":"WAN","selected":1},"lan":{"value":"LAN","selected":0}},"protocol":{"tcp":{"value":"TCP","selected":1},"udp":{"value":"UDP","selected":0}},"destination":{"network":"wanip","address":"","port":"443"},"target":"10.0.0.5","local-port":"443","descr":"orca:orca https","log":"1","created":{"time":"1"},"categories":""}}"#;
 
     type Route = (&'static str, String, u16, String);
 
     fn r(m: &'static str, p: &str, s: u16, b: &str) -> Route {
         (m, p.to_string(), s, b.to_string())
-    }
-
-    fn guarded_routes(write: Route) -> Vec<Route> {
-        vec![
-            r("POST", "/firewall/d_nat/savepoint", 200, SAVEPOINT),
-            write,
-            r("POST", "/firewall/d_nat/apply", 200, OK),
-        ]
     }
 
     fn run<T>(
@@ -881,6 +865,10 @@ mod tests {
         format!("GET {}", SEARCH.trim_start_matches('/'))
     }
 
+    fn get_rule_route() -> Route {
+        r("GET", "/firewall/d_nat/get_rule/aaaa-1111", 200, GET_RULE)
+    }
+
     #[test]
     fn list_drops_automatic_rows_and_maps_fields() {
         let body = search(&[row(OWNED, "10.0.0.5")]);
@@ -904,7 +892,7 @@ mod tests {
         assert_eq!(got.plan.action, Action::Create);
         assert!(got.plan.dry_run && !got.plan.executed);
         assert_eq!(got.plan.desired.unwrap().description, OWNED);
-        assert_eq!(got.plan.steps[0], "POST firewall/d_nat/savepoint");
+        assert_eq!(got.plan.steps[0], "POST firewall/d_nat/add_rule");
         assert_eq!(paths, vec![search_path()]);
     }
 
@@ -922,10 +910,13 @@ mod tests {
     }
 
     #[test]
-    fn set_takes_savepoint_before_creating_then_applies_and_confirms() {
+    fn set_creates_applies_and_health_checks() {
         let (got, paths, calls) = run(
             &search(&[]),
-            guarded_routes(r("POST", "/firewall/d_nat/add_rule", 200, SAVED)),
+            vec![
+                r("POST", "/firewall/d_nat/add_rule", 200, SAVED),
+                r("POST", "/firewall/d_nat/apply", 200, OK),
+            ],
             async |c, cfg| set_port_forward(c, cfg, desired("10.0.0.5"), exec()).await,
         );
         let got = got.unwrap();
@@ -937,13 +928,12 @@ mod tests {
             paths,
             vec![
                 search_path(),
-                "POST firewall/d_nat/savepoint".into(),
                 "POST firewall/d_nat/add_rule".into(),
                 "POST firewall/d_nat/apply".into(),
                 search_path(),
             ]
         );
-        let sent: Value = plugin_toolkit::serde_json::from_str(&calls[2].2).unwrap();
+        let sent: Value = plugin_toolkit::serde_json::from_str(&calls[1].2).unwrap();
         assert_eq!(sent["rule"]["descr"], OWNED);
         assert_eq!(sent["rule"]["destination"]["network"], "wanip");
         assert_eq!(sent["rule"]["local-port"], "443");
@@ -953,78 +943,39 @@ mod tests {
     }
 
     #[test]
-    fn write_failure_after_savepoint_reverts_to_it() {
+    fn write_failure_keeps_the_original_error() {
         let (got, paths, _) = run(
             &search(&[]),
-            vec![
-                r("POST", "/firewall/d_nat/savepoint", 200, SAVEPOINT),
-                r(
-                    "POST",
-                    "/firewall/d_nat/add_rule",
-                    200,
-                    r#"{"result":"failed"}"#,
-                ),
-                r(
-                    "POST",
-                    &format!("/firewall/d_nat/revert/{REV}"),
-                    200,
-                    r#"{"status":"ok"}"#,
-                ),
-            ],
+            vec![r(
+                "POST",
+                "/firewall/d_nat/add_rule",
+                200,
+                r#"{"result":"failed"}"#,
+            )],
             async |c, cfg| set_port_forward(c, cfg, desired("10.0.0.5"), exec()).await,
         );
-        assert!(got.is_err());
-        assert_eq!(
-            paths.last().unwrap(),
-            &format!("POST firewall/d_nat/revert/{REV}")
-        );
+        assert!(matches!(got, Err(OpnsenseError::Rejected { .. })));
         assert!(!paths.iter().any(|x| x.contains("/apply")));
     }
 
     #[test]
-    fn apply_failure_reverts_and_reports_not_applied() {
-        let (got, paths, _) = run(
-            &search(&[]),
-            vec![
-                r("POST", "/firewall/d_nat/savepoint", 200, SAVEPOINT),
-                r("POST", "/firewall/d_nat/add_rule", 200, SAVED),
-                r("POST", "/firewall/d_nat/apply", 500, "boom"),
-                r(
-                    "POST",
-                    &format!("/firewall/d_nat/revert/{REV}"),
-                    200,
-                    r#"{"status":"ok"}"#,
-                ),
-            ],
-            async |c, cfg| set_port_forward(c, cfg, desired("10.0.0.5"), exec()).await,
-        );
-        match got {
-            Err(OpnsenseError::NotApplied { uuid, reason }) => {
-                assert_eq!(uuid, "bbbb-2222");
-                assert!(reason.contains("reverted"));
-            }
-            other => panic!("expected NotApplied, got {other:?}"),
-        }
-        assert!(paths.iter().any(|x| x.ends_with(&format!("revert/{REV}"))));
-    }
-
-    #[test]
-    fn set_updates_owned_rule_by_description() {
+    fn set_updates_owned_rule_after_snapshot() {
         let body = search(&[row(OWNED, "10.0.0.5")]);
         let (got, paths, _) = run(
             &body,
-            guarded_routes(r(
-                "POST",
-                "/firewall/d_nat/set_rule/aaaa-1111",
-                200,
-                r#"{"result":"saved"}"#,
-            )),
+            vec![
+                get_rule_route(),
+                r("POST", "/firewall/d_nat/set_rule/aaaa-1111", 200, UPDATED),
+                r("POST", "/firewall/d_nat/apply", 200, OK),
+            ],
             async |c, cfg| set_port_forward(c, cfg, desired("10.0.0.6"), exec()).await,
         );
         let got = got.unwrap();
         assert_eq!(got.plan.action, Action::Update);
         assert_eq!(got.plan.desired.unwrap().uuid.as_deref(), Some(UUID));
-        assert!(paths.contains(&"POST firewall/d_nat/set_rule/aaaa-1111".to_string()));
+        let snap = paths.iter().position(|x| x.contains("get_rule")).unwrap();
+        let set = paths.iter().position(|x| x.contains("set_rule")).unwrap();
+        assert!(snap < set);
     }
 
     #[test]
@@ -1042,12 +993,11 @@ mod tests {
         let body = search(&[row("orca https", "10.0.0.5")]);
         let (got, _, calls) = run(
             &body,
-            guarded_routes(r(
-                "POST",
-                "/firewall/d_nat/set_rule/aaaa-1111",
-                200,
-                r#"{"result":"saved"}"#,
-            )),
+            vec![
+                get_rule_route(),
+                r("POST", "/firewall/d_nat/set_rule/aaaa-1111", 200, UPDATED),
+                r("POST", "/firewall/d_nat/apply", 200, OK),
+            ],
             async |c, cfg| {
                 let opts = WriteOptions {
                     adopt: true,
@@ -1084,28 +1034,27 @@ mod tests {
     }
 
     #[test]
-    fn delete_takes_savepoint_before_removing_owned_rule() {
+    fn delete_snapshots_then_removes_owned_rule() {
         let body = search(&[row(OWNED, "10.0.0.5")]);
         let (got, paths, _) = run(
             &body,
-            guarded_routes(r(
-                "POST",
-                "/firewall/d_nat/del_rule/aaaa-1111",
-                200,
-                r#"{"result":"deleted"}"#,
-            )),
+            vec![
+                get_rule_route(),
+                r("POST", "/firewall/d_nat/del_rule/aaaa-1111", 200, DELETED),
+                r("POST", "/firewall/d_nat/apply", 200, OK),
+            ],
             async |c, cfg| delete_port_forward(c, cfg, "orca https", exec()).await,
         );
         let got = got.unwrap();
         assert_eq!(got.plan.action, Action::Delete);
-        assert!(!got.apply.unwrap().rollback_protected);
-        let sp = paths.iter().position(|x| x.ends_with("savepoint")).unwrap();
+        assert!(got.plan.executed);
+        let snap = paths.iter().position(|x| x.contains("get_rule")).unwrap();
         let del = paths.iter().position(|x| x.contains("del_rule")).unwrap();
-        assert!(sp < del);
+        assert!(snap < del);
     }
 
     #[test]
-    fn delete_dry_run_and_missing_rule() {
+    fn delete_dry_run_and_executed_absent_are_noops() {
         let body = search(&[row(OWNED, "10.0.0.5")]);
         let (got, paths, _) = run(&body, vec![], async |c, cfg| {
             delete_port_forward(c, cfg, "orca https", WriteOptions::default()).await
@@ -1114,10 +1063,13 @@ mod tests {
         assert_eq!(got.plan.action, Action::Delete);
         assert!(got.plan.dry_run);
         assert_eq!(paths.len(), 1);
-        let (got, _, _) = run(&search(&[]), vec![], async |c, cfg| {
+        let (got, paths, _) = run(&search(&[]), vec![], async |c, cfg| {
             delete_port_forward(c, cfg, "Anti-Lockout Rule", exec()).await
         });
-        assert!(matches!(got, Err(OpnsenseError::NotFound { .. })));
+        let got = got.unwrap();
+        assert_eq!(got.plan.action, Action::Absent);
+        assert!(!got.plan.executed);
+        assert_eq!(paths.len(), 1);
     }
 
     #[test]
@@ -1130,66 +1082,42 @@ mod tests {
     }
 
     #[test]
-    fn without_savepoint_wan_applies_unguarded() {
-        let (got, paths, _) = run(
-            &search(&[]),
-            vec![
-                r("POST", "/firewall/d_nat/savepoint", 404, "not found"),
-                r("POST", "/firewall/d_nat/add_rule", 200, SAVED),
-                r("POST", "/firewall/d_nat/apply", 200, OK),
-            ],
-            async |c, cfg| set_port_forward(c, cfg, desired("10.0.0.5"), exec()).await,
-        );
-        let applied = got.unwrap().apply.unwrap();
-        assert!(!applied.rollback_protected && applied.revision.is_none());
-        assert!(paths.iter().any(|x| x.ends_with("firewall/d_nat/apply")));
-    }
-
-    #[test]
-    fn without_savepoint_non_wan_needs_allow_unprotected() {
+    fn non_wan_desired_or_current_needs_allow_unprotected() {
         let mut rule = desired("10.0.0.5");
         rule.interface = "opt1".into();
         rule.destination = "10.0.0.9".into();
         rule.destination_port = "8443".into();
-        let (got, paths, _) = run(
-            &search(&[]),
-            vec![r("POST", "/firewall/d_nat/savepoint", 404, "not found")],
-            async |c, cfg| set_port_forward(c, cfg, rule, exec()).await,
-        );
+        let (got, paths, _) = run(&search(&[]), vec![], async |c, cfg| {
+            set_port_forward(c, cfg, rule.clone(), exec()).await
+        });
         assert!(
             matches!(got, Err(OpnsenseError::InvalidArgument(m)) if m.contains("allow_unprotected"))
         );
-        assert!(!paths.iter().any(|x| x.contains("add_rule")));
-    }
+        assert_eq!(paths.len(), 1);
 
-    #[test]
-    fn unprotected_apply_failure_reports_saved_uuid() {
+        let mut multi = row(OWNED, "10.0.0.5");
+        multi["interface"] = json!("wan,lan");
+        let (got, paths, _) = run(&search(&[multi]), vec![], async |c, cfg| {
+            set_port_forward(c, cfg, desired("10.0.0.6"), exec()).await
+        });
+        assert!(matches!(got, Err(OpnsenseError::InvalidArgument(m)) if m.contains("\"lan\"")));
+        assert_eq!(paths.len(), 1);
+
         let (got, _, _) = run(
             &search(&[]),
             vec![
-                r("POST", "/firewall/d_nat/savepoint", 404, "not found"),
                 r("POST", "/firewall/d_nat/add_rule", 200, SAVED),
-                r("POST", "/firewall/d_nat/apply", 500, "boom"),
+                r("POST", "/firewall/d_nat/apply", 200, OK),
             ],
-            async |c, cfg| set_port_forward(c, cfg, desired("10.0.0.5"), exec()).await,
+            async |c, cfg| {
+                let opts = WriteOptions {
+                    allow_unprotected: true,
+                    ..exec()
+                };
+                set_port_forward(c, cfg, rule, opts).await
+            },
         );
-        assert!(matches!(got, Err(OpnsenseError::NotApplied { uuid, .. }) if uuid == "bbbb-2222"));
-    }
-
-    #[test]
-    fn unsafe_savepoint_revision_is_rejected_before_writing() {
-        let (got, paths, _) = run(
-            &search(&[]),
-            vec![r(
-                "POST",
-                "/firewall/d_nat/savepoint",
-                200,
-                r#"{"revision":"../x"}"#,
-            )],
-            async |c, cfg| set_port_forward(c, cfg, desired("10.0.0.5"), exec()).await,
-        );
-        assert!(matches!(got, Err(OpnsenseError::Malformed(_))));
-        assert!(!paths.iter().any(|x| x.contains("add_rule")));
+        assert!(!got.unwrap().apply.unwrap().rollback_protected);
     }
 
     #[test]
@@ -1278,129 +1206,159 @@ mod tests {
         assert_eq!(paths.len(), 2);
     }
 
-    #[test]
-    fn non_ok_apply_status_reverts_and_reports_not_applied() {
-        let (got, paths, _) = run(
-            &search(&[]),
-            vec![
-                r("POST", "/firewall/d_nat/savepoint", 200, SAVEPOINT),
-                r("POST", "/firewall/d_nat/add_rule", 200, SAVED),
-                r(
-                    "POST",
-                    "/firewall/d_nat/apply",
-                    200,
-                    r#"{"status":"error"}"#,
-                ),
-                r(
-                    "POST",
-                    &format!("/firewall/d_nat/revert/{REV}"),
-                    200,
-                    r#"{"status":"ok"}"#,
-                ),
-            ],
-            async |c, cfg| set_port_forward(c, cfg, desired("10.0.0.5"), exec()).await,
-        );
-        assert!(
-            matches!(got, Err(OpnsenseError::NotApplied { reason, .. }) if reason.contains("reverted to savepoint"))
-        );
-        assert!(paths.iter().any(|x| x.ends_with(&format!("revert/{REV}"))));
-    }
-
-    #[test]
-    fn non_ok_revert_is_reported_as_not_reverted() {
-        let (got, _, _) = run(
-            &search(&[]),
-            vec![
-                r("POST", "/firewall/d_nat/savepoint", 200, SAVEPOINT),
-                r("POST", "/firewall/d_nat/add_rule", 200, SAVED),
-                r("POST", "/firewall/d_nat/apply", 500, "boom"),
-                r(
-                    "POST",
-                    &format!("/firewall/d_nat/revert/{REV}"),
-                    200,
-                    r#"{"status":"unknown (or removed) savepoint"}"#,
-                ),
-            ],
-            async |c, cfg| set_port_forward(c, cfg, desired("10.0.0.5"), exec()).await,
-        );
-        assert!(
-            matches!(got, Err(OpnsenseError::NotApplied { reason, .. }) if reason.contains("NOT reverted"))
-        );
-    }
-
-    fn health_fail_mock(
-        savepoint: (u16, &'static str),
+    fn compensation_mock(
+        fail: &'static str,
     ) -> impl Fn(&str, &str, usize) -> (u16, String) + Send + Sync + 'static {
         move |method: &str, url: &str, n: usize| match (method, url) {
-            ("GET", u) if u.ends_with(SEARCH) && n == 0 => (200, search(&[])),
-            ("GET", u) if u.ends_with(SEARCH) => (502, "bad gateway".into()),
-            ("POST", u) if u.ends_with("/savepoint") => (savepoint.0, savepoint.1.into()),
-            ("POST", u) if u.ends_with("/add_rule") => (200, SAVED.into()),
-            ("POST", u) if u.ends_with("/firewall/d_nat/apply") => (200, OK.into()),
-            ("POST", u) if u.ends_with(&format!("/revert/{REV}")) => {
-                (200, r#"{"status":"ok"}"#.into())
+            ("GET", u) if u.ends_with(SEARCH) && n == 0 => {
+                if fail.starts_with("create") {
+                    (200, search(&[]))
+                } else {
+                    (200, search(&[row(OWNED, "10.0.0.5")]))
+                }
             }
+            ("GET", u) if u.ends_with(SEARCH) => (502, "bad gateway".into()),
+            ("GET", u) if u.ends_with("/get_rule/aaaa-1111") => (200, GET_RULE.into()),
+            ("POST", u) if u.ends_with("/add_rule") => (200, SAVED.into()),
+            ("POST", u) if u.ends_with("/set_rule/aaaa-1111") => (200, UPDATED.into()),
+            ("POST", u) if u.ends_with("/del_rule/aaaa-1111") => (200, DELETED.into()),
+            ("POST", u) if u.ends_with("/del_rule/bbbb-2222") => (200, DELETED.into()),
+            ("POST", u)
+                if u.ends_with("/firewall/d_nat/apply") && fail.ends_with("apply") && n == 0 =>
+            {
+                (200, r#"{"status":"Error (1)"}"#.into())
+            }
+            ("POST", u) if u.ends_with("/firewall/d_nat/apply") => (200, OK.into()),
             _ => panic!("unexpected {method} {url}"),
         }
     }
 
-    #[test]
-    fn failed_health_check_reverts_to_pre_change_savepoint() {
-        let (got, p) = with_stateful_mock(health_fail_mock((200, SAVEPOINT)), async |c, cfg| {
-            set_port_forward(c, cfg, desired("10.0.0.5"), exec()).await
+    fn compensation_calls(fail: &'static str) -> (Result<NatWritePlan, OpnsenseError>, Vec<Call>) {
+        let calls: Calls = Arc::default();
+        let log = calls.clone();
+        let respond = compensation_mock(fail);
+        let sink = Box::new(move |_cap: &str, op: &str| {
+            let req: HttpRequest = plugin_toolkit::serde_json::from_str(op).unwrap();
+            let mut log = log.lock().unwrap();
+            let seen = log
+                .iter()
+                .filter(|(m, u, _)| *m == req.method && *u == req.url)
+                .count();
+            log.push((
+                req.method.clone(),
+                req.url.clone(),
+                String::from_utf8(req.body.clone()).unwrap(),
+            ));
+            let (status, body) = respond(&req.method, &req.url, seen);
+            Ok::<String, String>(
+                plugin_toolkit::serde_json::to_string(&HttpResponse {
+                    status,
+                    headers: vec![],
+                    body: body.into_bytes(),
+                })
+                .unwrap(),
+            )
         });
+        let cfg = Config::new("https://10.0.0.1", "k", "s").insecure(true);
+        let result = plugin_toolkit::capsink::with_cap_sink(sink, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let client = cfg.build_client()?;
+                if fail.starts_with("delete") {
+                    delete_port_forward(&client, &cfg, "orca https", exec()).await
+                } else {
+                    set_port_forward(&client, &cfg, desired("10.0.0.6"), exec()).await
+                }
+            })
+        });
+        let calls = calls.lock().unwrap().clone();
+        (result, calls)
+    }
+
+    #[test]
+    fn failed_health_after_create_deletes_the_new_rule() {
+        let (got, calls) = compensation_calls("create-health");
         match got {
             Err(OpnsenseError::Unhealthy { uuid, reason }) => {
                 assert_eq!(uuid, "bbbb-2222");
                 assert!(
-                    reason.contains(&format!("reverted to savepoint {REV}")),
+                    reason.contains("compensated: deleted created rule bbbb-2222"),
                     "{reason}"
                 );
             }
             other => panic!("expected Unhealthy, got {other:?}"),
         }
-        let sp = p.iter().position(|x| x.ends_with("savepoint")).unwrap();
-        let add = p.iter().position(|x| x.ends_with("add_rule")).unwrap();
-        let rv = p
+        let p = paths(&calls);
+        assert!(p.contains(&"POST firewall/d_nat/del_rule/bbbb-2222".to_string()));
+        assert_eq!(p.iter().filter(|x| x.ends_with("d_nat/apply")).count(), 2);
+    }
+
+    #[test]
+    fn failed_apply_after_update_restores_the_snapshot() {
+        let (got, calls) = compensation_calls("update-apply");
+        match got {
+            Err(OpnsenseError::NotApplied { uuid, reason }) => {
+                assert_eq!(uuid, UUID);
+                assert!(
+                    reason.contains("compensated: restored rule aaaa-1111"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected NotApplied, got {other:?}"),
+        }
+        let restore = calls
             .iter()
-            .position(|x| x.ends_with(&format!("revert/{REV}")))
+            .filter(|(m, u, _)| m == "POST" && u.ends_with("/set_rule/aaaa-1111"))
+            .nth(1)
             .unwrap();
-        assert!(sp < add && add < rv);
+        let body: Value = plugin_toolkit::serde_json::from_str(&restore.2).unwrap();
+        assert_eq!(body["rule"]["interface"], "wan");
+        assert_eq!(body["rule"]["protocol"], "tcp");
+        assert_eq!(body["rule"]["target"], "10.0.0.5");
+        assert_eq!(body["rule"]["log"], "1");
+        assert!(body["rule"].get("created").is_none());
+        assert!(body["rule"].get("categories").is_none());
+        assert!(body["rule"]["destination"].get("address").is_none());
     }
 
     #[test]
-    fn failed_health_check_without_savepoint_reports_not_reverted() {
-        let (got, p) = with_stateful_mock(health_fail_mock((404, "not found")), async |c, cfg| {
-            set_port_forward(c, cfg, desired("10.0.0.5"), exec()).await
-        });
-        assert!(
-            matches!(got, Err(OpnsenseError::Unhealthy { reason, .. }) if reason.contains("NOT reverted"))
-        );
-        assert!(!p.iter().any(|x| x.contains("revert")));
+    fn failed_health_after_delete_re_adds_the_snapshot() {
+        let (got, calls) = compensation_calls("delete-health");
+        match got {
+            Err(OpnsenseError::Unhealthy { reason, .. }) => {
+                assert!(
+                    reason.contains("compensated: re-added deleted rule"),
+                    "{reason}"
+                )
+            }
+            other => panic!("expected Unhealthy, got {other:?}"),
+        }
+        let readd = calls
+            .iter()
+            .find(|(m, u, _)| m == "POST" && u.ends_with("/add_rule"))
+            .unwrap();
+        let body: Value = plugin_toolkit::serde_json::from_str(&readd.2).unwrap();
+        assert_eq!(body["rule"]["descr"], OWNED);
+        assert_eq!(body["rule"]["destination"]["port"], "443");
     }
 
     #[test]
-    fn non_wan_needs_allow_unprotected_even_with_savepoint() {
-        let mut rule = desired("10.0.0.5");
-        rule.interface = "opt1".into();
-        rule.destination = "10.0.0.9".into();
-        rule.destination_port = "8443".into();
-        let (got, paths, _) = run(&search(&[]), vec![], async |c, cfg| {
-            set_port_forward(c, cfg, rule.clone(), exec()).await
-        });
-        assert!(
-            matches!(got, Err(OpnsenseError::InvalidArgument(m)) if m.contains("allow_unprotected"))
+    fn failed_compensation_is_reported() {
+        let (got, _, _) = run(
+            &search(&[]),
+            vec![
+                r("POST", "/firewall/d_nat/add_rule", 200, SAVED),
+                r("POST", "/firewall/d_nat/apply", 500, "boom"),
+                r("POST", "/firewall/d_nat/del_rule/bbbb-2222", 500, "boom"),
+            ],
+            async |c, cfg| set_port_forward(c, cfg, desired("10.0.0.5"), exec()).await,
         );
-        assert!(!paths.iter().any(|x| x.contains("savepoint")));
-        let routes = guarded_routes(r("POST", "/firewall/d_nat/add_rule", 200, SAVED));
-        let (got, _, _) = run(&search(&[]), routes, async |c, cfg| {
-            let opts = WriteOptions {
-                allow_unprotected: true,
-                ..exec()
-            };
-            set_port_forward(c, cfg, rule, opts).await
-        });
-        assert!(!got.unwrap().apply.unwrap().rollback_protected);
+        assert!(
+            matches!(got, Err(OpnsenseError::NotApplied { reason, .. }) if reason.contains("compensation FAILED"))
+        );
     }
 
     #[test]
@@ -1409,11 +1367,6 @@ mod tests {
         assert!(!status_is(&json!({"status": "ok"}), APPLIED));
         assert!(!status_is(&json!({"status": "Error (1)"}), APPLIED));
         assert!(!status_is(&json!({}), APPLIED));
-        assert!(status_is(&json!({"status": "ok"}), REVERTED));
-        assert!(!status_is(
-            &json!({"status": "unknown (or removed) savepoint"}),
-            REVERTED
-        ));
     }
 
     #[test]
