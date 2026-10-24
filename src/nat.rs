@@ -471,6 +471,30 @@ async fn revert(client: &reqwest::Client, cfg: &Config, revision: &str) -> Strin
     }
 }
 
+#[cfg(not(test))]
+const CANCEL_BACKOFF_MS: [u64; 5] = [0, 500, 1500, 3000, 5000];
+#[cfg(test)]
+const CANCEL_BACKOFF_MS: [u64; 5] = [0; 5];
+
+async fn cancel_rollback(
+    client: &reqwest::Client,
+    cfg: &Config,
+    rev: &str,
+) -> Result<Value, OpnsenseError> {
+    let path = format!("firewall/d_nat/cancel_rollback/{rev}");
+    let mut last = None;
+    for delay in CANCEL_BACKOFF_MS {
+        if delay > 0 {
+            plugin_toolkit::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
+        match post_ok(client, cfg, &path, ROLLBACK_CANCELLED).await {
+            Ok(v) => return Ok(v),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| OpnsenseError::Malformed("no cancel_rollback attempt".into())))
+}
+
 async fn guarded_write(
     client: &reqwest::Client,
     cfg: &Config,
@@ -526,17 +550,13 @@ async fn guarded_write(
             reason: e.to_string(),
         });
     }
-    if let Err(e) = post_ok(
-        client,
-        cfg,
-        &format!("firewall/d_nat/cancel_rollback/{rev}"),
-        ROLLBACK_CANCELLED,
-    )
-    .await
-    {
+    if let Err(e) = cancel_rollback(client, cfg, &rev).await {
         return Err(OpnsenseError::RollbackArmed {
             revision: rev,
-            reason: format!("cancel_rollback failed: {e}"),
+            reason: format!(
+                "cancel_rollback failed after {} tries: {e}",
+                CANCEL_BACKOFF_MS.len()
+            ),
         });
     }
     Ok((
@@ -761,6 +781,7 @@ mod tests {
         let cfg = Config::new("https://10.0.0.1", "k", "s").insecure(true);
         let result = plugin_toolkit::capsink::with_cap_sink(sink, || {
             let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
                 .build()
                 .unwrap();
             rt.block_on(async {
@@ -799,6 +820,7 @@ mod tests {
         let cfg = Config::new("https://10.0.0.1", "k", "s").insecure(true);
         let result = plugin_toolkit::capsink::with_cap_sink(sink, || {
             let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
                 .build()
                 .unwrap();
             rt.block_on(async {
@@ -1376,6 +1398,59 @@ mod tests {
         );
         assert!(
             matches!(got, Err(OpnsenseError::NotApplied { reason, .. }) if reason.contains("NOT reverted"))
+        );
+    }
+
+    #[test]
+    fn cancel_rollback_retries_until_the_timer_lock_exists() {
+        let mock = |method: &str, url: &str, n: usize| -> (u16, String) {
+            match (method, url) {
+                ("GET", u) if u.ends_with(SEARCH) => (200, search(&[])),
+                ("POST", u) if u.ends_with("/savepoint") => (200, SAVEPOINT.into()),
+                ("POST", u) if u.ends_with("/add_rule") => (200, SAVED.into()),
+                ("POST", u) if u.ends_with(&format!("/apply/{REV}")) => (200, OK.into()),
+                ("POST", u) if u.ends_with(&format!("/cancel_rollback/{REV}")) && n < 2 => {
+                    (200, r#"{"status":"Execute error"}"#.into())
+                }
+                ("POST", u) if u.ends_with(&format!("/cancel_rollback/{REV}")) => {
+                    (200, CANCELLED.into())
+                }
+                _ => panic!("unexpected {method} {url}"),
+            }
+        };
+        let (got, p) = with_stateful_mock(mock, async |c, cfg| {
+            set_port_forward(c, cfg, desired("10.0.0.5"), exec()).await
+        });
+        assert!(got.unwrap().apply.unwrap().rollback_protected);
+        assert_eq!(
+            p.iter().filter(|x| x.contains("cancel_rollback")).count(),
+            3
+        );
+    }
+
+    #[test]
+    fn cancel_rollback_gives_up_after_bounded_tries() {
+        let mock = |method: &str, url: &str, _n: usize| -> (u16, String) {
+            match (method, url) {
+                ("GET", u) if u.ends_with(SEARCH) => (200, search(&[])),
+                ("POST", u) if u.ends_with("/savepoint") => (200, SAVEPOINT.into()),
+                ("POST", u) if u.ends_with("/add_rule") => (200, SAVED.into()),
+                ("POST", u) if u.ends_with(&format!("/apply/{REV}")) => (200, OK.into()),
+                ("POST", u) if u.ends_with(&format!("/cancel_rollback/{REV}")) => {
+                    (200, r#"{"status":"Execute error"}"#.into())
+                }
+                _ => panic!("unexpected {method} {url}"),
+            }
+        };
+        let (got, p) = with_stateful_mock(mock, async |c, cfg| {
+            set_port_forward(c, cfg, desired("10.0.0.5"), exec()).await
+        });
+        assert!(
+            matches!(got, Err(OpnsenseError::RollbackArmed { revision, .. }) if revision == REV)
+        );
+        assert_eq!(
+            p.iter().filter(|x| x.contains("cancel_rollback")).count(),
+            CANCEL_BACKOFF_MS.len()
         );
     }
 
