@@ -21,8 +21,8 @@
 //!   - `opnsense.netflow.health`                NetFlow capture/collection + flowd service state
 //!   - `opnsense.netflow.repair`                re-enable collection and restart stopped flowd services
 //!   - `opnsense.nat.forward.list`              list destination NAT port forwards
-//!   - `opnsense.nat.forward.set`               upsert a port forward by description, rollback-guarded apply
-//!   - `opnsense.nat.forward.delete`            delete a port forward by description, rollback-guarded apply
+//!   - `opnsense.nat.forward.set`               upsert a port forward by description; reverts on a failed health check
+//!   - `opnsense.nat.forward.delete`            delete a port forward by description; reverts on a failed health check
 //!
 //! Every mutating verb needs the admin role (also for its dry run) and only
 //! writes with `--execute`; without it the verb returns the plan. A `set` or
@@ -654,7 +654,8 @@ pub struct NatForwardArgs {
     #[serde(default)]
     pub adopt: bool,
     /// Permit a change on a non-WAN interface (anything but `wan`, including
-    /// `opt*`) when the appliance has no savepoint/rollback (OPNsense 26.7+).
+    /// `opt*`). NAT changes have no automatic rollback, so this is always
+    /// required off `wan`.
     #[arg(long)]
     #[serde(default)]
     pub allow_unprotected: bool,
@@ -677,12 +678,14 @@ fn default_filter_rule() -> FilterRule {
 }
 
 /// [MUTATES STATE] Upsert an orca-owned (`orca:`-prefixed) port-forward keyed
-/// by description, applied under the firewall savepoint/rollback guard. An
-/// unchanged rule is left alone. Only `wan` is WAN: on any other interface
-/// (`opt*` included) management ports (22/80/443 plus the endpoint's
-/// `management_ports`) may only forward to a literal host that is not a
-/// firewall address, and without savepoint support `allow_unprotected` is
-/// required. `dryRun` previews.
+/// by description. A savepoint is taken before the write; after apply orca
+/// checks the API still answers and reverts to the savepoint if not. There is
+/// no appliance-side rollback timer for NAT, so `rollback_protected` is always
+/// false, and OPNsense 26.7+ has no d_nat savepoint at all (no revert). An
+/// unchanged rule is left alone. Only `wan` is WAN: any other interface (`opt*`
+/// included) needs `allow_unprotected`, and management ports (22/80/443 plus
+/// the endpoint's `management_ports`) may only forward to a literal host that
+/// is not a firewall address. `dryRun` previews.
 #[orca_tool(
     domain = "opnsense",
     verb = "nat.forward.set",
@@ -732,16 +735,17 @@ pub struct NatForwardKeyArgs {
     #[serde(default)]
     pub adopt: bool,
     /// Permit a change on a non-WAN interface (anything but `wan`, including
-    /// `opt*`) when the appliance has no savepoint/rollback (OPNsense 26.7+).
+    /// `opt*`). NAT changes have no automatic rollback, so this is always
+    /// required off `wan`.
     #[arg(long)]
     #[serde(default)]
     pub allow_unprotected: bool,
 }
 
 /// [MUTATES STATE] Delete the orca-owned port-forward with this description,
-/// applied under the firewall savepoint/rollback guard. Without savepoint
-/// support a non-WAN rule (anything but `wan`, `opt*` included) needs
-/// `allow_unprotected`. `dryRun` previews.
+/// with the same savepoint + health-check revert as `nat.forward.set` (no
+/// revert on OPNsense 26.7+). A non-WAN rule (anything but `wan`, `opt*`
+/// included) needs `allow_unprotected`. `dryRun` previews.
 #[orca_tool(
     domain = "opnsense",
     verb = "nat.forward.delete",

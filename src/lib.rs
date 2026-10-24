@@ -258,10 +258,8 @@ pub enum OpnsenseError {
     AliasDiscovery(String),
     #[error("rule saved but not applied (uuid {uuid}): {reason}")]
     NotApplied { uuid: String, reason: String },
-    #[error(
-        "applied but the API stopped answering; rollback to savepoint {revision} left armed: {reason}"
-    )]
-    RollbackArmed { revision: String, reason: String },
+    #[error("change applied but the health check failed (uuid {uuid}): {reason}")]
+    Unhealthy { uuid: String, reason: String },
 }
 
 #[derive(Debug, Clone)]

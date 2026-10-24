@@ -431,7 +431,6 @@ async fn savepoint(
 }
 
 const APPLIED: &str = "OK";
-const ROLLBACK_CANCELLED: &str = "";
 const REVERTED: &str = "ok";
 
 fn status_is(v: &Value, expected: &str) -> bool {
@@ -471,28 +470,15 @@ async fn revert(client: &reqwest::Client, cfg: &Config, revision: &str) -> Strin
     }
 }
 
-#[cfg(not(test))]
-const CANCEL_BACKOFF_MS: [u64; 5] = [0, 500, 1500, 3000, 5000];
-#[cfg(test)]
-const CANCEL_BACKOFF_MS: [u64; 5] = [0; 5];
-
-async fn cancel_rollback(
+async fn revert_if_saved(
     client: &reqwest::Client,
     cfg: &Config,
-    rev: &str,
-) -> Result<Value, OpnsenseError> {
-    let path = format!("firewall/d_nat/cancel_rollback/{rev}");
-    let mut last = None;
-    for delay in CANCEL_BACKOFF_MS {
-        if delay > 0 {
-            plugin_toolkit::time::sleep(std::time::Duration::from_millis(delay)).await;
-        }
-        match post_ok(client, cfg, &path, ROLLBACK_CANCELLED).await {
-            Ok(v) => return Ok(v),
-            Err(e) => last = Some(e),
-        }
+    revision: &Option<String>,
+) -> String {
+    match revision {
+        Some(rev) => revert(client, cfg, rev).await,
+        None => "appliance has no d_nat savepoint; NOT reverted".to_string(),
     }
-    Err(last.unwrap_or_else(|| OpnsenseError::Malformed("no cancel_rollback attempt".into())))
 }
 
 async fn guarded_write(
@@ -502,12 +488,12 @@ async fn guarded_write(
     allow_unprotected: bool,
     write: impl AsyncFnOnce() -> Result<Option<String>, OpnsenseError>,
 ) -> Result<(Option<String>, ApplyResult), OpnsenseError> {
-    let revision = savepoint(client, cfg).await?;
-    if revision.is_none() && interface != "wan" && !allow_unprotected {
+    if interface != "wan" && !allow_unprotected {
         return Err(invalid(format!(
-            "appliance has no savepoint/rollback; refusing an unguarded change on non-WAN interface {interface:?} without allow_unprotected"
+            "NAT changes have no automatic rollback; refusing a change on non-WAN interface {interface:?} without allow_unprotected"
         )));
     }
+    let revision = savepoint(client, cfg).await?;
     let uuid = match write().await {
         Ok(uuid) => uuid,
         Err(e) => {
@@ -519,60 +505,34 @@ async fn guarded_write(
             });
         }
     };
-    let Some(rev) = revision else {
-        let status = post_ok(client, cfg, "firewall/d_nat/apply", APPLIED)
-            .await
-            .map_err(|e| OpnsenseError::NotApplied {
-                uuid: uuid.clone().unwrap_or_default(),
-                reason: e.to_string(),
-            })?;
-        return Ok((
-            uuid,
-            ApplyResult {
-                revision: None,
-                rollback_protected: false,
-                status,
-            },
-        ));
-    };
-    let status = match post_ok(client, cfg, &format!("firewall/d_nat/apply/{rev}"), APPLIED).await {
+    let status = match post_ok(client, cfg, "firewall/d_nat/apply", APPLIED).await {
         Ok(s) => s,
         Err(e) => {
             return Err(OpnsenseError::NotApplied {
                 uuid: uuid.unwrap_or_default(),
-                reason: format!("{e}; {}", revert(client, cfg, &rev).await),
+                reason: format!("{e}; {}", revert_if_saved(client, cfg, &revision).await),
             });
         }
     };
     if let Err(e) = list_port_forwards(client, cfg).await {
-        return Err(OpnsenseError::RollbackArmed {
-            revision: rev,
-            reason: e.to_string(),
-        });
-    }
-    if let Err(e) = cancel_rollback(client, cfg, &rev).await {
-        return Err(OpnsenseError::RollbackArmed {
-            revision: rev,
-            reason: format!(
-                "cancel_rollback failed after {} tries: {e}",
-                CANCEL_BACKOFF_MS.len()
-            ),
+        return Err(OpnsenseError::Unhealthy {
+            uuid: uuid.unwrap_or_default(),
+            reason: format!("{e}; {}", revert_if_saved(client, cfg, &revision).await),
         });
     }
     Ok((
         uuid,
         ApplyResult {
-            revision: Some(rev),
-            rollback_protected: true,
+            revision,
+            rollback_protected: false,
             status,
         },
     ))
 }
 
-const APPLY_STEPS: [&str; 3] = [
-    "POST firewall/d_nat/apply/<savepoint>",
-    "GET firewall/d_nat/search_rule (health)",
-    "POST firewall/d_nat/cancel_rollback/<savepoint>",
+const APPLY_STEPS: [&str; 2] = [
+    "POST firewall/d_nat/apply",
+    "GET firewall/d_nat/search_rule (health; on failure POST firewall/d_nat/revert/<savepoint>)",
 ];
 
 fn steps(write: String) -> Vec<String> {
@@ -872,7 +832,6 @@ mod tests {
     const SAVEPOINT: &str = r#"{"status":"ok","retention":"60","revision":"1729700000.12"}"#;
     const SAVED: &str = r#"{"result":"saved","uuid":"bbbb-2222"}"#;
     const OK: &str = "{\"status\":\"OK\\n\\n\"}";
-    const CANCELLED: &str = r#"{"status":"\n\n"}"#;
     const OWNED: &str = "orca:orca https";
 
     type Route = (&'static str, String, u16, String);
@@ -885,13 +844,7 @@ mod tests {
         vec![
             r("POST", "/firewall/d_nat/savepoint", 200, SAVEPOINT),
             write,
-            r("POST", &format!("/firewall/d_nat/apply/{REV}"), 200, OK),
-            r(
-                "POST",
-                &format!("/firewall/d_nat/cancel_rollback/{REV}"),
-                200,
-                CANCELLED,
-            ),
+            r("POST", "/firewall/d_nat/apply", 200, OK),
         ]
     }
 
@@ -979,16 +932,15 @@ mod tests {
         assert_eq!(got.plan.action, Action::Create);
         assert!(got.plan.executed);
         assert_eq!(got.plan.desired.unwrap().uuid.as_deref(), Some("bbbb-2222"));
-        assert!(got.apply.unwrap().rollback_protected);
+        assert!(!got.apply.unwrap().rollback_protected);
         assert_eq!(
             paths,
             vec![
                 search_path(),
                 "POST firewall/d_nat/savepoint".into(),
                 "POST firewall/d_nat/add_rule".into(),
-                format!("POST firewall/d_nat/apply/{REV}"),
+                "POST firewall/d_nat/apply".into(),
                 search_path(),
-                format!("POST firewall/d_nat/cancel_rollback/{REV}"),
             ]
         );
         let sent: Value = plugin_toolkit::serde_json::from_str(&calls[2].2).unwrap();
@@ -998,31 +950,6 @@ mod tests {
         assert_eq!(sent["rule"]["protocol"], "tcp");
         assert_eq!(sent["rule"]["pass"], "pass");
         assert_eq!(sent["rule"]["disabled"], "0");
-    }
-
-    #[test]
-    fn health_failure_after_apply_returns_rollback_armed_with_savepoint_revision() {
-        let mock = |method: &str, url: &str, n: usize| -> (u16, String) {
-            match (method, url) {
-                ("GET", u) if u.ends_with(SEARCH) && n == 0 => (200, search(&[])),
-                ("GET", u) if u.ends_with(SEARCH) => (502, "bad gateway".into()),
-                ("POST", u) if u.ends_with("/savepoint") => (200, SAVEPOINT.into()),
-                ("POST", u) if u.ends_with("/add_rule") => (200, SAVED.into()),
-                ("POST", u) if u.ends_with(&format!("/apply/{REV}")) => (200, OK.into()),
-                _ => panic!("unexpected {method} {url}"),
-            }
-        };
-        let (got, p) = with_stateful_mock(mock, async |c, cfg| {
-            set_port_forward(c, cfg, desired("10.0.0.5"), exec()).await
-        });
-        match got {
-            Err(OpnsenseError::RollbackArmed { revision, .. }) => assert_eq!(revision, REV),
-            other => panic!("expected RollbackArmed, got {other:?}"),
-        }
-        let sp = p.iter().position(|x| x.ends_with("savepoint")).unwrap();
-        let add = p.iter().position(|x| x.ends_with("add_rule")).unwrap();
-        assert!(sp < add);
-        assert!(!p.iter().any(|x| x.contains("cancel_rollback")));
     }
 
     #[test]
@@ -1061,7 +988,7 @@ mod tests {
             vec![
                 r("POST", "/firewall/d_nat/savepoint", 200, SAVEPOINT),
                 r("POST", "/firewall/d_nat/add_rule", 200, SAVED),
-                r("POST", &format!("/firewall/d_nat/apply/{REV}"), 500, "boom"),
+                r("POST", "/firewall/d_nat/apply", 500, "boom"),
                 r(
                     "POST",
                     &format!("/firewall/d_nat/revert/{REV}"),
@@ -1171,7 +1098,7 @@ mod tests {
         );
         let got = got.unwrap();
         assert_eq!(got.plan.action, Action::Delete);
-        assert!(got.apply.unwrap().rollback_protected);
+        assert!(!got.apply.unwrap().rollback_protected);
         let sp = paths.iter().position(|x| x.ends_with("savepoint")).unwrap();
         let del = paths.iter().position(|x| x.contains("del_rule")).unwrap();
         assert!(sp < del);
@@ -1360,7 +1287,7 @@ mod tests {
                 r("POST", "/firewall/d_nat/add_rule", 200, SAVED),
                 r(
                     "POST",
-                    &format!("/firewall/d_nat/apply/{REV}"),
+                    "/firewall/d_nat/apply",
                     200,
                     r#"{"status":"error"}"#,
                 ),
@@ -1386,7 +1313,7 @@ mod tests {
             vec![
                 r("POST", "/firewall/d_nat/savepoint", 200, SAVEPOINT),
                 r("POST", "/firewall/d_nat/add_rule", 200, SAVED),
-                r("POST", &format!("/firewall/d_nat/apply/{REV}"), 500, "boom"),
+                r("POST", "/firewall/d_nat/apply", 500, "boom"),
                 r(
                     "POST",
                     &format!("/firewall/d_nat/revert/{REV}"),
@@ -1401,57 +1328,79 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cancel_rollback_retries_until_the_timer_lock_exists() {
-        let mock = |method: &str, url: &str, n: usize| -> (u16, String) {
-            match (method, url) {
-                ("GET", u) if u.ends_with(SEARCH) => (200, search(&[])),
-                ("POST", u) if u.ends_with("/savepoint") => (200, SAVEPOINT.into()),
-                ("POST", u) if u.ends_with("/add_rule") => (200, SAVED.into()),
-                ("POST", u) if u.ends_with(&format!("/apply/{REV}")) => (200, OK.into()),
-                ("POST", u) if u.ends_with(&format!("/cancel_rollback/{REV}")) && n < 2 => {
-                    (200, r#"{"status":"Execute error"}"#.into())
-                }
-                ("POST", u) if u.ends_with(&format!("/cancel_rollback/{REV}")) => {
-                    (200, CANCELLED.into())
-                }
-                _ => panic!("unexpected {method} {url}"),
+    fn health_fail_mock(
+        savepoint: (u16, &'static str),
+    ) -> impl Fn(&str, &str, usize) -> (u16, String) + Send + Sync + 'static {
+        move |method: &str, url: &str, n: usize| match (method, url) {
+            ("GET", u) if u.ends_with(SEARCH) && n == 0 => (200, search(&[])),
+            ("GET", u) if u.ends_with(SEARCH) => (502, "bad gateway".into()),
+            ("POST", u) if u.ends_with("/savepoint") => (savepoint.0, savepoint.1.into()),
+            ("POST", u) if u.ends_with("/add_rule") => (200, SAVED.into()),
+            ("POST", u) if u.ends_with("/firewall/d_nat/apply") => (200, OK.into()),
+            ("POST", u) if u.ends_with(&format!("/revert/{REV}")) => {
+                (200, r#"{"status":"ok"}"#.into())
             }
-        };
-        let (got, p) = with_stateful_mock(mock, async |c, cfg| {
-            set_port_forward(c, cfg, desired("10.0.0.5"), exec()).await
-        });
-        assert!(got.unwrap().apply.unwrap().rollback_protected);
-        assert_eq!(
-            p.iter().filter(|x| x.contains("cancel_rollback")).count(),
-            3
-        );
+            _ => panic!("unexpected {method} {url}"),
+        }
     }
 
     #[test]
-    fn cancel_rollback_gives_up_after_bounded_tries() {
-        let mock = |method: &str, url: &str, _n: usize| -> (u16, String) {
-            match (method, url) {
-                ("GET", u) if u.ends_with(SEARCH) => (200, search(&[])),
-                ("POST", u) if u.ends_with("/savepoint") => (200, SAVEPOINT.into()),
-                ("POST", u) if u.ends_with("/add_rule") => (200, SAVED.into()),
-                ("POST", u) if u.ends_with(&format!("/apply/{REV}")) => (200, OK.into()),
-                ("POST", u) if u.ends_with(&format!("/cancel_rollback/{REV}")) => {
-                    (200, r#"{"status":"Execute error"}"#.into())
-                }
-                _ => panic!("unexpected {method} {url}"),
+    fn failed_health_check_reverts_to_pre_change_savepoint() {
+        let (got, p) = with_stateful_mock(health_fail_mock((200, SAVEPOINT)), async |c, cfg| {
+            set_port_forward(c, cfg, desired("10.0.0.5"), exec()).await
+        });
+        match got {
+            Err(OpnsenseError::Unhealthy { uuid, reason }) => {
+                assert_eq!(uuid, "bbbb-2222");
+                assert!(
+                    reason.contains(&format!("reverted to savepoint {REV}")),
+                    "{reason}"
+                );
             }
-        };
-        let (got, p) = with_stateful_mock(mock, async |c, cfg| {
+            other => panic!("expected Unhealthy, got {other:?}"),
+        }
+        let sp = p.iter().position(|x| x.ends_with("savepoint")).unwrap();
+        let add = p.iter().position(|x| x.ends_with("add_rule")).unwrap();
+        let rv = p
+            .iter()
+            .position(|x| x.ends_with(&format!("revert/{REV}")))
+            .unwrap();
+        assert!(sp < add && add < rv);
+    }
+
+    #[test]
+    fn failed_health_check_without_savepoint_reports_not_reverted() {
+        let (got, p) = with_stateful_mock(health_fail_mock((404, "not found")), async |c, cfg| {
             set_port_forward(c, cfg, desired("10.0.0.5"), exec()).await
         });
         assert!(
-            matches!(got, Err(OpnsenseError::RollbackArmed { revision, .. }) if revision == REV)
+            matches!(got, Err(OpnsenseError::Unhealthy { reason, .. }) if reason.contains("NOT reverted"))
         );
-        assert_eq!(
-            p.iter().filter(|x| x.contains("cancel_rollback")).count(),
-            CANCEL_BACKOFF_MS.len()
+        assert!(!p.iter().any(|x| x.contains("revert")));
+    }
+
+    #[test]
+    fn non_wan_needs_allow_unprotected_even_with_savepoint() {
+        let mut rule = desired("10.0.0.5");
+        rule.interface = "opt1".into();
+        rule.destination = "10.0.0.9".into();
+        rule.destination_port = "8443".into();
+        let (got, paths, _) = run(&search(&[]), vec![], async |c, cfg| {
+            set_port_forward(c, cfg, rule.clone(), exec()).await
+        });
+        assert!(
+            matches!(got, Err(OpnsenseError::InvalidArgument(m)) if m.contains("allow_unprotected"))
         );
+        assert!(!paths.iter().any(|x| x.contains("savepoint")));
+        let routes = guarded_routes(r("POST", "/firewall/d_nat/add_rule", 200, SAVED));
+        let (got, _, _) = run(&search(&[]), routes, async |c, cfg| {
+            let opts = WriteOptions {
+                allow_unprotected: true,
+                ..exec()
+            };
+            set_port_forward(c, cfg, rule, opts).await
+        });
+        assert!(!got.unwrap().apply.unwrap().rollback_protected);
     }
 
     #[test]
@@ -1459,42 +1408,12 @@ mod tests {
         assert!(status_is(&json!({"status": "OK\n\n"}), APPLIED));
         assert!(!status_is(&json!({"status": "ok"}), APPLIED));
         assert!(!status_is(&json!({"status": "Error (1)"}), APPLIED));
-        assert!(status_is(&json!({"status": "\n\n"}), ROLLBACK_CANCELLED));
-        assert!(!status_is(
-            &json!({"status": "Execute error"}),
-            ROLLBACK_CANCELLED
-        ));
-        assert!(!status_is(&json!({}), ROLLBACK_CANCELLED));
+        assert!(!status_is(&json!({}), APPLIED));
         assert!(status_is(&json!({"status": "ok"}), REVERTED));
         assert!(!status_is(
             &json!({"status": "unknown (or removed) savepoint"}),
             REVERTED
         ));
-    }
-
-    #[test]
-    fn cancel_rollback_failure_reports_rollback_armed() {
-        for (status, body) in [(200, r#"{"status":"Execute error"}"#), (500, "boom")] {
-            let (got, _, _) = run(
-                &search(&[]),
-                vec![
-                    r("POST", "/firewall/d_nat/savepoint", 200, SAVEPOINT),
-                    r("POST", "/firewall/d_nat/add_rule", 200, SAVED),
-                    r("POST", &format!("/firewall/d_nat/apply/{REV}"), 200, OK),
-                    r(
-                        "POST",
-                        &format!("/firewall/d_nat/cancel_rollback/{REV}"),
-                        status,
-                        body,
-                    ),
-                ],
-                async |c, cfg| set_port_forward(c, cfg, desired("10.0.0.5"), exec()).await,
-            );
-            match got {
-                Err(OpnsenseError::RollbackArmed { revision, .. }) => assert_eq!(revision, REV),
-                other => panic!("expected RollbackArmed, got {other:?}"),
-            }
-        }
     }
 
     #[test]

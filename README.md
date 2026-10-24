@@ -74,6 +74,17 @@ orca service.backup opnsense      # pull config.xml
 orca service.configure opnsense   # apply config via the opnsense API
 ```
 
+### NAT port forwards
+
+`opnsense.nat.forward.{list,set,delete}` manage destination NAT rules through `firewall/d_nat` (OPNsense 26.1+). `set` is an upsert keyed by description; orca stores and only touches rules prefixed `orca:` (pass `adopt` to take over an existing rule). Writes are admin-only and support `dryRun`.
+
+Safety:
+
+- A config savepoint is taken before each write. After apply, orca checks the API still answers; if not, it calls `firewall/d_nat/revert/<savepoint>` and reports whether the revert worked.
+- OPNsense's own rollback timer only restores filter rules, never NAT, so it is not used and `rollback_protected` is always `false`. OPNsense 26.7+ has no d_nat savepoint/revert, so there is no revert there.
+- Only `wan` counts as WAN. Any other interface (`opt*` included) needs `allow_unprotected`.
+- On non-WAN interfaces, forwards touching 22/80/443 (plus the endpoint's `management_ports`, comma-separated) are refused unless the destination is a literal host address that is not a firewall interface address.
+
 ## Layout
 
 - `src/` — the plugin (pure Rust): the `ServiceBackend` descriptor + `configure` / `status`.
