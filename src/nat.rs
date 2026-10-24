@@ -143,11 +143,12 @@ pub struct ApplyResult {
     pub status: Value,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct WriteOptions {
     pub execute: bool,
     pub adopt: bool,
     pub allow_unprotected: bool,
+    pub management_ports: Vec<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -262,7 +263,24 @@ pub fn marked(description: &str) -> String {
     }
 }
 
-const MANAGEMENT_PORTS: [u16; 3] = [22, 80, 443];
+pub const DEFAULT_MANAGEMENT_PORTS: [u16; 3] = [22, 80, 443];
+
+pub fn parse_management_ports(raw: Option<&str>) -> Result<Vec<u16>, OpnsenseError> {
+    let mut ports = DEFAULT_MANAGEMENT_PORTS.to_vec();
+    for part in raw
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        let p = port(part)
+            .ok_or_else(|| invalid(format!("management port {part:?} must be 1-65535")))?;
+        if !ports.contains(&p) {
+            ports.push(p);
+        }
+    }
+    Ok(ports)
+}
 
 fn port_bounds(p: &str) -> Option<(u16, u16)> {
     match p.split_once('-') {
@@ -271,20 +289,66 @@ fn port_bounds(p: &str) -> Option<(u16, u16)> {
     }
 }
 
-pub fn guard_management(rule: &PortForward) -> Result<(), OpnsenseError> {
+fn literal_host(destination: &str) -> Option<Ipv4Addr> {
+    destination
+        .strip_suffix("/32")
+        .unwrap_or(destination)
+        .parse()
+        .ok()
+}
+
+pub fn guard_management(
+    rule: &PortForward,
+    management_ports: &[u16],
+) -> Result<Option<Ipv4Addr>, OpnsenseError> {
     if rule.interface == "wan" {
-        return Ok(());
+        return Ok(None);
     }
-    let hits_self = rule.destination == "any" || rule.destination.ends_with("ip");
-    let Some((lo, hi)) = port_bounds(&rule.destination_port) else {
-        return Ok(());
+    let (lo, hi) = port_bounds(&rule.destination_port).ok_or_else(|| {
+        invalid(format!(
+            "port {:?} is not a port or range",
+            rule.destination_port
+        ))
+    })?;
+    let mut ports = DEFAULT_MANAGEMENT_PORTS.iter().chain(management_ports);
+    let Some(p) = ports.find(|p| (lo..=hi).contains(*p)) else {
+        return Ok(None);
     };
-    match MANAGEMENT_PORTS.iter().find(|p| (lo..=hi).contains(*p)) {
-        Some(p) if hits_self => Err(invalid(format!(
-            "refusing a forward of {} port {p} on non-WAN interface {:?}: it would capture firewall management (GUI/SSH)",
+    literal_host(&rule.destination).map(Some).ok_or_else(|| {
+        invalid(format!(
+            "refusing a forward of {} port {p} on non-WAN interface {:?}: only a literal host address that is not the firewall may be forwarded on a management port",
             rule.destination, rule.interface
-        ))),
-        _ => Ok(()),
+        ))
+    })
+}
+
+pub async fn ensure_not_firewall_address(
+    client: &reqwest::Client,
+    cfg: &Config,
+    ip: Ipv4Addr,
+) -> Result<(), OpnsenseError> {
+    let details: Value = get_json(
+        client,
+        &cfg.api_url("diagnostics/interface/get_interface_config"),
+    )
+    .await?;
+    let Some(devices) = details.as_object() else {
+        return Err(OpnsenseError::Malformed(format!(
+            "interface config is not an object: {details}"
+        )));
+    };
+    let own = devices
+        .values()
+        .filter_map(|d| d.get("ipv4").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|a| a.get("ipaddr").and_then(Value::as_str))
+        .any(|a| a.parse::<Ipv4Addr>().ok() == Some(ip));
+    if own {
+        Err(invalid(format!(
+            "refusing a management-port forward to {ip}: it is a firewall interface address"
+        )))
+    } else {
+        Ok(())
     }
 }
 
@@ -366,16 +430,32 @@ async fn savepoint(
     }
 }
 
+fn status_ok(v: &Value) -> bool {
+    v.get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|s| s.trim().eq_ignore_ascii_case("ok"))
+}
+
+async fn post_ok(
+    client: &reqwest::Client,
+    cfg: &Config,
+    path: &str,
+) -> Result<Value, OpnsenseError> {
+    let v = post_json(client, &cfg.api_url(path), &json!({})).await?;
+    if status_ok(&v) {
+        Ok(v)
+    } else {
+        Err(OpnsenseError::Rejected {
+            result: v.get("status").map(Value::to_string).unwrap_or_default(),
+            body: v.to_string(),
+        })
+    }
+}
+
 async fn revert(client: &reqwest::Client, cfg: &Config, revision: &str) -> String {
-    match post_json(
-        client,
-        &cfg.api_url(&format!("firewall/d_nat/revert/{revision}")),
-        &json!({}),
-    )
-    .await
-    {
+    match post_ok(client, cfg, &format!("firewall/d_nat/revert/{revision}")).await {
         Ok(_) => format!("reverted to savepoint {revision}"),
-        Err(e) => format!("revert to savepoint {revision} failed: {e}"),
+        Err(e) => format!("NOT reverted to savepoint {revision}: {e}"),
     }
 }
 
@@ -404,7 +484,7 @@ async fn guarded_write(
         }
     };
     let Some(rev) = revision else {
-        let status = post_json(client, &cfg.api_url("firewall/d_nat/apply"), &json!({}))
+        let status = post_ok(client, cfg, "firewall/d_nat/apply")
             .await
             .map_err(|e| OpnsenseError::NotApplied {
                 uuid: uuid.clone().unwrap_or_default(),
@@ -419,13 +499,7 @@ async fn guarded_write(
             },
         ));
     };
-    let status = match post_json(
-        client,
-        &cfg.api_url(&format!("firewall/d_nat/apply/{rev}")),
-        &json!({}),
-    )
-    .await
-    {
+    let status = match post_ok(client, cfg, &format!("firewall/d_nat/apply/{rev}")).await {
         Ok(s) => s,
         Err(e) => {
             return Err(OpnsenseError::NotApplied {
@@ -440,12 +514,18 @@ async fn guarded_write(
             reason: e.to_string(),
         });
     }
-    post_json(
+    if let Err(e) = post_ok(
         client,
-        &cfg.api_url(&format!("firewall/d_nat/cancel_rollback/{rev}")),
-        &json!({}),
+        cfg,
+        &format!("firewall/d_nat/cancel_rollback/{rev}"),
     )
-    .await?;
+    .await
+    {
+        return Err(OpnsenseError::RollbackArmed {
+            revision: rev,
+            reason: format!("cancel_rollback failed: {e}"),
+        });
+    }
     Ok((
         uuid,
         ApplyResult {
@@ -474,9 +554,12 @@ pub async fn plan_set(
     mut desired: PortForward,
     adopt: bool,
     execute: bool,
+    management_ports: &[u16],
 ) -> Result<NatWritePlan, OpnsenseError> {
     validate(&desired)?;
-    guard_management(&desired)?;
+    if let Some(ip) = guard_management(&desired, management_ports)? {
+        ensure_not_firewall_address(client, cfg, ip).await?;
+    }
     let current = find_owned(client, cfg, &desired.description, adopt).await?;
     desired.description = marked(&desired.description);
     let (action, steps) = match &current {
@@ -508,7 +591,15 @@ pub async fn set_port_forward(
     desired: PortForward,
     opts: WriteOptions,
 ) -> Result<NatWritePlan, OpnsenseError> {
-    let mut out = plan_set(client, cfg, desired, opts.adopt, opts.execute).await?;
+    let mut out = plan_set(
+        client,
+        cfg,
+        desired,
+        opts.adopt,
+        opts.execute,
+        &opts.management_ports,
+    )
+    .await?;
     if !opts.execute || out.plan.action == Action::Unchanged {
         return Ok(out);
     }
@@ -1095,6 +1186,7 @@ mod tests {
     fn without_savepoint_non_wan_needs_allow_unprotected() {
         let mut rule = desired("10.0.0.5");
         rule.interface = "opt1".into();
+        rule.destination = "10.0.0.9".into();
         rule.destination_port = "8443".into();
         let (got, paths, _) = run(
             &search(&[]),
@@ -1138,23 +1230,164 @@ mod tests {
     }
 
     #[test]
-    fn management_ports_on_self_are_refused_off_wan() {
+    fn management_ports_off_wan_fail_closed_except_literal_hosts() {
+        let mut rule = desired("10.0.0.5");
+        rule.interface = "opt1".into();
+        for d in ["lanip", "lannet", "any", "10.0.0.0/24", "some_alias"] {
+            rule.destination = d.into();
+            for p in ["22", "80", "443", "1-1024"] {
+                rule.destination_port = p.into();
+                assert!(guard_management(&rule, &[]).is_err(), "accepted {d}:{p}");
+            }
+        }
+        rule.destination = "lanip".into();
+        rule.destination_port = "8443".into();
+        assert_eq!(guard_management(&rule, &[]).unwrap(), None);
+        assert!(guard_management(&rule, &[8443]).is_err());
+        rule.destination_port = "443".into();
+        for d in ["10.0.0.9", "10.0.0.9/32"] {
+            rule.destination = d.into();
+            assert_eq!(
+                guard_management(&rule, &[]).unwrap(),
+                Some("10.0.0.9".parse().unwrap())
+            );
+        }
+        let mut wan = desired("10.0.0.5");
+        wan.destination = "any".into();
+        assert_eq!(guard_management(&wan, &[]).unwrap(), None);
+    }
+
+    #[test]
+    fn management_ports_merge_endpoint_config() {
+        assert_eq!(parse_management_ports(None).unwrap(), vec![22, 80, 443]);
+        assert_eq!(
+            parse_management_ports(Some("8443, 22")).unwrap(),
+            vec![22, 80, 443, 8443]
+        );
+        assert!(parse_management_ports(Some("0")).is_err());
+        assert!(parse_management_ports(Some("x")).is_err());
+    }
+
+    const IFCONFIG: &str = r#"{"vtnet1":{"ipv4":[{"ipaddr":"10.0.0.1","subnetbits":24}]},"lo0":{"ipv4":[{"ipaddr":"127.0.0.1"}]}}"#;
+
+    fn lan_rule(dest: &str) -> PortForward {
         let mut rule = desired("10.0.0.5");
         rule.interface = "lan".into();
-        rule.destination = "lanip".into();
-        for p in ["22", "80", "443", "1-1024"] {
-            rule.destination_port = p.into();
-            assert!(guard_management(&rule).is_err(), "accepted {p}");
+        rule.destination = dest.into();
+        rule
+    }
+
+    #[test]
+    fn management_port_to_firewall_address_is_refused() {
+        let (got, paths, _) = run(
+            &search(&[]),
+            vec![r(
+                "GET",
+                "/diagnostics/interface/get_interface_config",
+                200,
+                IFCONFIG,
+            )],
+            async |c, cfg| {
+                set_port_forward(c, cfg, lan_rule("10.0.0.1"), WriteOptions::default()).await
+            },
+        );
+        assert!(
+            matches!(got, Err(OpnsenseError::InvalidArgument(m)) if m.contains("firewall interface address"))
+        );
+        assert!(!paths.iter().any(|x| x.contains("search_rule")));
+    }
+
+    #[test]
+    fn management_port_to_other_literal_host_is_planned() {
+        let (got, paths, _) = run(
+            &search(&[]),
+            vec![r(
+                "GET",
+                "/diagnostics/interface/get_interface_config",
+                200,
+                IFCONFIG,
+            )],
+            async |c, cfg| {
+                set_port_forward(c, cfg, lan_rule("10.0.0.9"), WriteOptions::default()).await
+            },
+        );
+        assert_eq!(got.unwrap().plan.action, Action::Create);
+        assert_eq!(paths.len(), 2);
+    }
+
+    #[test]
+    fn non_ok_apply_status_reverts_and_reports_not_applied() {
+        let (got, paths, _) = run(
+            &search(&[]),
+            vec![
+                r("POST", "/firewall/d_nat/savepoint", 200, SAVEPOINT),
+                r("POST", "/firewall/d_nat/add_rule", 200, SAVED),
+                r(
+                    "POST",
+                    &format!("/firewall/d_nat/apply/{REV}"),
+                    200,
+                    r#"{"status":"error"}"#,
+                ),
+                r(
+                    "POST",
+                    &format!("/firewall/d_nat/revert/{REV}"),
+                    200,
+                    r#"{"status":"ok"}"#,
+                ),
+            ],
+            async |c, cfg| set_port_forward(c, cfg, desired("10.0.0.5"), exec()).await,
+        );
+        assert!(
+            matches!(got, Err(OpnsenseError::NotApplied { reason, .. }) if reason.contains("reverted to savepoint"))
+        );
+        assert!(paths.iter().any(|x| x.ends_with(&format!("revert/{REV}"))));
+    }
+
+    #[test]
+    fn non_ok_revert_is_reported_as_not_reverted() {
+        let (got, _, _) = run(
+            &search(&[]),
+            vec![
+                r("POST", "/firewall/d_nat/savepoint", 200, SAVEPOINT),
+                r("POST", "/firewall/d_nat/add_rule", 200, SAVED),
+                r("POST", &format!("/firewall/d_nat/apply/{REV}"), 500, "boom"),
+                r(
+                    "POST",
+                    &format!("/firewall/d_nat/revert/{REV}"),
+                    200,
+                    r#"{"status":"unknown (or removed) savepoint"}"#,
+                ),
+            ],
+            async |c, cfg| set_port_forward(c, cfg, desired("10.0.0.5"), exec()).await,
+        );
+        assert!(
+            matches!(got, Err(OpnsenseError::NotApplied { reason, .. }) if reason.contains("NOT reverted"))
+        );
+    }
+
+    #[test]
+    fn cancel_rollback_failure_reports_rollback_armed() {
+        for (status, body) in [(200, r#"{"status":"error"}"#), (500, "boom")] {
+            let (got, _, _) = run(
+                &search(&[]),
+                vec![
+                    r("POST", "/firewall/d_nat/savepoint", 200, SAVEPOINT),
+                    r("POST", "/firewall/d_nat/add_rule", 200, SAVED),
+                    r("POST", &format!("/firewall/d_nat/apply/{REV}"), 200, OK),
+                    r(
+                        "POST",
+                        &format!("/firewall/d_nat/cancel_rollback/{REV}"),
+                        status,
+                        body,
+                    ),
+                ],
+                async |c, cfg| set_port_forward(c, cfg, desired("10.0.0.5"), exec()).await,
+            );
+            match got {
+                Err(OpnsenseError::RollbackArmed { revision, .. }) => assert_eq!(revision, REV),
+                other => panic!("expected RollbackArmed, got {other:?}"),
+            }
         }
-        rule.destination_port = "8443".into();
-        assert!(guard_management(&rule).is_ok());
-        rule.destination_port = "443".into();
-        rule.destination = "10.0.0.9".into();
-        assert!(guard_management(&rule).is_ok());
-        rule.destination = "any".into();
-        assert!(guard_management(&rule).is_err());
-        let wan = desired("10.0.0.5");
-        assert!(guard_management(&wan).is_ok());
     }
 
     #[test]

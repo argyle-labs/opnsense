@@ -58,6 +58,7 @@ pub struct OpnsenseEndpoint {
     pub api_secret: String,
     pub insecure: bool,
     pub enabled: bool,
+    pub management_ports: Option<String>,
 }
 
 // ── HTTP client helper ─────────────────────────────────────────────────────
@@ -76,6 +77,13 @@ pub(crate) async fn resolve_config(name: &str) -> Result<Config> {
         api_secret,
         insecure: row.insecure,
     })
+}
+
+fn endpoint_management_ports(name: &str) -> Result<Vec<u16>> {
+    let row = endpoint_db::require(name)?;
+    Ok(crate::nat::parse_management_ports(
+        row.management_ports.as_deref(),
+    )?)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -609,7 +617,8 @@ pub struct NatForwardArgs {
     /// Rule description; the upsert key. Stored with an `orca:` prefix.
     #[arg(long)]
     pub description: String,
-    /// Interface id the rule listens on.
+    /// Interface id the rule listens on. Only `wan` counts as WAN; `opt*` and
+    /// every other interface are treated as non-WAN.
     #[arg(long, default_value = "wan")]
     #[serde(default = "default_interface")]
     pub interface: String,
@@ -644,14 +653,11 @@ pub struct NatForwardArgs {
     #[arg(long)]
     #[serde(default)]
     pub adopt: bool,
-    /// Permit a non-WAN change on appliances without savepoint/rollback.
+    /// Permit a change on a non-WAN interface (anything but `wan`, including
+    /// `opt*`) when the appliance has no savepoint/rollback (OPNsense 26.7+).
     #[arg(long)]
     #[serde(default)]
     pub allow_unprotected: bool,
-    /// Apply. Without it the verb only reports the plan.
-    #[arg(long)]
-    #[serde(default)]
-    pub execute: bool,
 }
 
 fn default_interface() -> String {
@@ -670,10 +676,20 @@ fn default_filter_rule() -> FilterRule {
     FilterRule::Pass
 }
 
-/// [MUTATES STATE with --execute] Upsert an orca-owned port-forward keyed by
-/// description, applied under the firewall savepoint/rollback guard. An
-/// unchanged rule is left alone. Dry run by default.
-#[orca_tool(domain = "opnsense", verb = "nat.forward.set", data_mutation = true)]
+/// [MUTATES STATE] Upsert an orca-owned (`orca:`-prefixed) port-forward keyed
+/// by description, applied under the firewall savepoint/rollback guard. An
+/// unchanged rule is left alone. Only `wan` is WAN: on any other interface
+/// (`opt*` included) management ports (22/80/443 plus the endpoint's
+/// `management_ports`) may only forward to a literal host that is not a
+/// firewall address, and without savepoint support `allow_unprotected` is
+/// required. `dryRun` previews.
+#[orca_tool(
+    domain = "opnsense",
+    verb = "nat.forward.set",
+    role = "admin",
+    data_mutation = true,
+    execute_gated = true
+)]
 async fn opnsense_nat_forward_set(args: NatForwardArgs, ctx: &ToolCtx) -> Result<NatWritePlan> {
     require_admin(ctx)?;
     let desired = PortForward {
@@ -689,13 +705,15 @@ async fn opnsense_nat_forward_set(args: NatForwardArgs, ctx: &ToolCtx) -> Result
         description: args.description,
         filter_rule: args.filter_rule,
     };
+    let management_ports = endpoint_management_ports(&args.name)?;
+    crate::nat::validate(&desired)?;
+    crate::nat::guard_management(&desired, &management_ports)?;
     let opts = WriteOptions {
-        execute: args.execute,
+        execute: true,
         adopt: args.adopt,
         allow_unprotected: args.allow_unprotected,
+        management_ports,
     };
-    crate::nat::validate(&desired)?;
-    crate::nat::guard_management(&desired)?;
     let cfg = resolve_config(&args.name).await?;
     let client = cfg.build_client()?;
     Ok(crate::nat::set_port_forward(&client, &cfg, desired, opts).await?)
@@ -713,20 +731,24 @@ pub struct NatForwardKeyArgs {
     #[arg(long)]
     #[serde(default)]
     pub adopt: bool,
-    /// Permit a non-WAN change on appliances without savepoint/rollback.
+    /// Permit a change on a non-WAN interface (anything but `wan`, including
+    /// `opt*`) when the appliance has no savepoint/rollback (OPNsense 26.7+).
     #[arg(long)]
     #[serde(default)]
     pub allow_unprotected: bool,
-    /// Apply. Without it the verb only reports the plan.
-    #[arg(long)]
-    #[serde(default)]
-    pub execute: bool,
 }
 
-/// [MUTATES STATE with --execute] Delete the orca-owned port-forward with this
-/// description, applied under the firewall savepoint/rollback guard. Dry run by
-/// default.
-#[orca_tool(domain = "opnsense", verb = "nat.forward.delete", data_mutation = true)]
+/// [MUTATES STATE] Delete the orca-owned port-forward with this description,
+/// applied under the firewall savepoint/rollback guard. Without savepoint
+/// support a non-WAN rule (anything but `wan`, `opt*` included) needs
+/// `allow_unprotected`. `dryRun` previews.
+#[orca_tool(
+    domain = "opnsense",
+    verb = "nat.forward.delete",
+    role = "admin",
+    data_mutation = true,
+    execute_gated = true
+)]
 async fn opnsense_nat_forward_delete(
     args: NatForwardKeyArgs,
     ctx: &ToolCtx,
@@ -736,9 +758,10 @@ async fn opnsense_nat_forward_delete(
     let cfg = resolve_config(&args.name).await?;
     let client = cfg.build_client()?;
     let opts = WriteOptions {
-        execute: args.execute,
+        execute: true,
         adopt: args.adopt,
         allow_unprotected: args.allow_unprotected,
+        management_ports: Vec::new(),
     };
     Ok(crate::nat::delete_port_forward(&client, &cfg, &args.description, opts).await?)
 }
