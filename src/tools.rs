@@ -33,7 +33,7 @@ use plugin_toolkit::prelude::*;
 use plugin_toolkit::reqwest;
 
 use crate::authz::require_admin;
-use crate::nat::{FilterRule, NatProtocol, NatWritePlan, PortForward};
+use crate::nat::{FilterRule, NatProtocol, NatWritePlan, PortForward, WriteOptions};
 use crate::plan::{Action, ReconfigurePlan, WritePlan};
 use crate::{
     Config, DotUpstream, HostOverride, Module, NetflowHealth, NetflowRepair, PiaForwardedPort,
@@ -593,10 +593,6 @@ async fn opnsense_netflow_repair(args: EndpointArgs, ctx: &ToolCtx) -> Result<Ne
     Ok(crate::repair_netflow(&client, &cfg).await?)
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// opnsense.nat.forward.{list,set,delete}
-// ═══════════════════════════════════════════════════════════════════════════
-
 /// List the user-defined destination NAT (port-forward) rules.
 #[orca_tool(domain = "opnsense", verb = "nat.forward.list", role = "any")]
 async fn opnsense_nat_forward_list(args: EndpointArgs, _ctx: &ToolCtx) -> Result<Vec<PortForward>> {
@@ -610,7 +606,7 @@ pub struct NatForwardArgs {
     /// Registered opnsense endpoint name.
     #[arg(long)]
     pub name: String,
-    /// Rule description; the upsert key.
+    /// Rule description; the upsert key. Stored with an `orca:` prefix.
     #[arg(long)]
     pub description: String,
     /// Interface id the rule listens on.
@@ -644,6 +640,18 @@ pub struct NatForwardArgs {
     #[arg(long)]
     #[serde(default)]
     pub disabled: bool,
+    /// Take over an existing rule that lacks the `orca:` description prefix.
+    #[arg(long)]
+    #[serde(default)]
+    pub adopt: bool,
+    /// Permit a non-WAN change on appliances without savepoint/rollback.
+    #[arg(long)]
+    #[serde(default)]
+    pub allow_unprotected: bool,
+    /// Apply. Without it the verb only reports the plan.
+    #[arg(long)]
+    #[serde(default)]
+    pub execute: bool,
 }
 
 fn default_interface() -> String {
@@ -662,15 +670,10 @@ fn default_filter_rule() -> FilterRule {
     FilterRule::Pass
 }
 
-/// [MUTATES STATE] Upsert a port-forward keyed by description, then apply with
-/// the firewall savepoint/rollback guard. An unchanged rule is left alone.
-/// `dryRun` previews.
-#[orca_tool(
-    domain = "opnsense",
-    verb = "nat.forward.set",
-    role = "admin",
-    execute_gated = true
-)]
+/// [MUTATES STATE with --execute] Upsert an orca-owned port-forward keyed by
+/// description, applied under the firewall savepoint/rollback guard. An
+/// unchanged rule is left alone. Dry run by default.
+#[orca_tool(domain = "opnsense", verb = "nat.forward.set", data_mutation = true)]
 async fn opnsense_nat_forward_set(args: NatForwardArgs, ctx: &ToolCtx) -> Result<NatWritePlan> {
     require_admin(ctx)?;
     let desired = PortForward {
@@ -686,10 +689,16 @@ async fn opnsense_nat_forward_set(args: NatForwardArgs, ctx: &ToolCtx) -> Result
         description: args.description,
         filter_rule: args.filter_rule,
     };
+    let opts = WriteOptions {
+        execute: args.execute,
+        adopt: args.adopt,
+        allow_unprotected: args.allow_unprotected,
+    };
     crate::nat::validate(&desired)?;
+    crate::nat::guard_management(&desired)?;
     let cfg = resolve_config(&args.name).await?;
     let client = cfg.build_client()?;
-    Ok(crate::nat::set_port_forward(&client, &cfg, desired).await?)
+    Ok(crate::nat::set_port_forward(&client, &cfg, desired, opts).await?)
 }
 
 #[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
@@ -700,16 +709,24 @@ pub struct NatForwardKeyArgs {
     /// Description of the rule to delete.
     #[arg(long)]
     pub description: String,
+    /// Take over an existing rule that lacks the `orca:` description prefix.
+    #[arg(long)]
+    #[serde(default)]
+    pub adopt: bool,
+    /// Permit a non-WAN change on appliances without savepoint/rollback.
+    #[arg(long)]
+    #[serde(default)]
+    pub allow_unprotected: bool,
+    /// Apply. Without it the verb only reports the plan.
+    #[arg(long)]
+    #[serde(default)]
+    pub execute: bool,
 }
 
-/// [MUTATES STATE] Delete the port-forward with this description, then apply
-/// with the firewall savepoint/rollback guard. `dryRun` previews.
-#[orca_tool(
-    domain = "opnsense",
-    verb = "nat.forward.delete",
-    role = "admin",
-    execute_gated = true
-)]
+/// [MUTATES STATE with --execute] Delete the orca-owned port-forward with this
+/// description, applied under the firewall savepoint/rollback guard. Dry run by
+/// default.
+#[orca_tool(domain = "opnsense", verb = "nat.forward.delete", data_mutation = true)]
 async fn opnsense_nat_forward_delete(
     args: NatForwardKeyArgs,
     ctx: &ToolCtx,
@@ -718,7 +735,12 @@ async fn opnsense_nat_forward_delete(
     crate::nat::validate_description(&args.description)?;
     let cfg = resolve_config(&args.name).await?;
     let client = cfg.build_client()?;
-    Ok(crate::nat::delete_port_forward(&client, &cfg, &args.description).await?)
+    let opts = WriteOptions {
+        execute: args.execute,
+        adopt: args.adopt,
+        allow_unprotected: args.allow_unprotected,
+    };
+    Ok(crate::nat::delete_port_forward(&client, &cfg, &args.description, opts).await?)
 }
 
 #[cfg(test)]

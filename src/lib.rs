@@ -256,6 +256,12 @@ pub enum OpnsenseError {
     AliasContent { alias: String, reason: String },
     #[error("PIA port alias discovery: {0}")]
     AliasDiscovery(String),
+    #[error("rule saved but not applied (uuid {uuid}): {reason}")]
+    NotApplied { uuid: String, reason: String },
+    #[error(
+        "applied but the API stopped answering; rollback to savepoint {revision} left armed: {reason}"
+    )]
+    RollbackArmed { revision: String, reason: String },
 }
 
 #[derive(Debug, Clone)]
