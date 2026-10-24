@@ -256,10 +256,20 @@ pub enum OpnsenseError {
     AliasContent { alias: String, reason: String },
     #[error("PIA port alias discovery: {0}")]
     AliasDiscovery(String),
-    #[error("rule saved but not applied (uuid {uuid}): {reason}")]
-    NotApplied { uuid: String, reason: String },
-    #[error("change applied but the health check failed (uuid {uuid}): {reason}")]
-    Unhealthy { uuid: String, reason: String },
+    #[error("rule saved but not applied (uuid {uuid}, compensated: {compensated}): {reason}")]
+    NotApplied {
+        uuid: String,
+        compensated: bool,
+        reason: String,
+    },
+    #[error(
+        "change applied but the health check failed (uuid {uuid}, compensated: {compensated}): {reason}"
+    )]
+    Unhealthy {
+        uuid: String,
+        compensated: bool,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone)]

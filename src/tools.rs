@@ -675,7 +675,8 @@ fn default_filter_rule() -> FilterRule {
 /// by description. An existing rule is snapshotted (`get_rule`) before it is
 /// changed; if apply or the post-apply health check fails, orca undoes the
 /// write (delete the created rule, or restore the snapshot) and re-applies,
-/// reporting whether that worked. OPNsense has no rollback for NAT, so
+/// reporting whether that worked (`compensated`). The health check only proves
+/// the OPNsense API still answers orca, not that the forward works from WAN. OPNsense has no rollback for NAT, so
 /// `rollback_protected` is always false. An unchanged rule is left alone. Only
 /// an exact `wan` is WAN: if the current or desired interface is anything else
 /// (`opt*` and multi-interface rules included) `allow_unprotected` is
@@ -738,8 +739,8 @@ pub struct NatForwardKeyArgs {
 }
 
 /// [MUTATES STATE] Delete the orca-owned port-forward with this description,
-/// snapshotting it first and re-adding the snapshot if apply or the health
-/// check fails. A rule on any interface but exactly `wan` (`opt*` and
+/// snapshotting it first and re-adding the snapshot (under a new uuid) if
+/// apply or the API health check fails. A rule on any interface but exactly `wan` (`opt*` and
 /// multi-interface included) needs `allow_unprotected`. An absent rule is a
 /// no-op. `dryRun` previews.
 #[orca_tool(

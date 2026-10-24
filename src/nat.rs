@@ -438,9 +438,23 @@ async fn post_ok(
 const SNAPSHOT_SKIP: [&str; 5] = ["created", "updated", "audit", "categories", "address"];
 
 fn flatten_rule(v: &Value) -> Value {
+    if let Some(items) = v.as_array() {
+        let parts: Vec<String> = items
+            .iter()
+            .map(|i| match flatten_rule(i) {
+                Value::String(s) => s,
+                other => other.to_string(),
+            })
+            .filter(|s| !s.is_empty())
+            .collect();
+        return Value::String(parts.join(","));
+    }
     let Some(obj) = v.as_object() else {
         return v.clone();
     };
+    if obj.is_empty() {
+        return Value::String(String::new());
+    }
     let is_options = !obj.is_empty()
         && obj
             .values()
@@ -483,7 +497,7 @@ enum Undo {
     Readd(Value),
 }
 
-async fn compensate(client: &reqwest::Client, cfg: &Config, undo: Undo) -> String {
+async fn compensate(client: &reqwest::Client, cfg: &Config, undo: Undo) -> (bool, String) {
     let (what, write) = match &undo {
         Undo::Delete(uuid) => (
             format!("deleted created rule {uuid}"),
@@ -503,17 +517,28 @@ async fn compensate(client: &reqwest::Client, cfg: &Config, undo: Undo) -> Strin
             )
             .await,
         ),
-        Undo::Readd(body) => (
-            "re-added deleted rule from snapshot".to_string(),
-            post_write(client, &cfg.api_url("firewall/d_nat/add_rule"), body).await,
-        ),
+        Undo::Readd(body) => {
+            let mut body = body.clone();
+            if let Some(rule) = body.get_mut("rule").and_then(Value::as_object_mut) {
+                rule.remove("associated-rule-id");
+            }
+            let added = post_write(client, &cfg.api_url("firewall/d_nat/add_rule"), &body).await;
+            let what = match &added {
+                Ok(Some(uuid)) => format!("re-added deleted rule from snapshot as new uuid {uuid}"),
+                _ => "re-added deleted rule from snapshot".to_string(),
+            };
+            (what, added)
+        }
     };
     if let Err(e) = write {
-        return format!("compensation FAILED ({what}): {e}");
+        return (false, format!("compensation FAILED ({what}): {e}"));
     }
     match post_ok(client, cfg, "firewall/d_nat/apply", APPLIED).await {
-        Ok(_) => format!("compensated: {what} and re-applied"),
-        Err(e) => format!("compensation written but re-apply FAILED ({what}): {e}"),
+        Ok(_) => (true, format!("compensated: {what} and re-applied")),
+        Err(e) => (
+            false,
+            format!("compensation written but re-apply FAILED ({what}): {e}"),
+        ),
     }
 }
 
@@ -535,16 +560,20 @@ async fn apply_and_verify(
     let status = match post_ok(client, cfg, "firewall/d_nat/apply", APPLIED).await {
         Ok(s) => s,
         Err(e) => {
+            let (compensated, note) = compensate(client, cfg, undo).await;
             return Err(OpnsenseError::NotApplied {
                 uuid: uuid.to_string(),
-                reason: format!("{e}; {}", compensate(client, cfg, undo).await),
+                compensated,
+                reason: format!("{e}; {note}"),
             });
         }
     };
     if let Err(e) = list_port_forwards(client, cfg).await {
+        let (compensated, note) = compensate(client, cfg, undo).await;
         return Err(OpnsenseError::Unhealthy {
             uuid: uuid.to_string(),
-            reason: format!("{e}; {}", compensate(client, cfg, undo).await),
+            compensated,
+            reason: format!("{e}; {note}"),
         });
     }
     Ok(ApplyResult {
@@ -555,7 +584,7 @@ async fn apply_and_verify(
 
 const APPLY_STEPS: [&str; 2] = [
     "POST firewall/d_nat/apply",
-    "GET firewall/d_nat/search_rule (health; on failure undo the write and re-apply)",
+    "GET firewall/d_nat/search_rule (health: proves only that the OPNsense API still answers orca, not that the forward works from WAN; on failure undo the write and re-apply)",
 ];
 
 fn steps(pre: Option<String>, write: String) -> Vec<String> {
@@ -811,7 +840,7 @@ mod tests {
     const DELETED: &str = r#"{"result":"deleted"}"#;
     const OK: &str = "{\"status\":\"OK\\n\\n\"}";
     const OWNED: &str = "orca:orca https";
-    const GET_RULE: &str = r#"{"rule":{"sequence":"10","disabled":"0","interface":{"wan":{"value":"WAN","selected":1},"lan":{"value":"LAN","selected":0}},"protocol":{"tcp":{"value":"TCP","selected":1},"udp":{"value":"UDP","selected":0}},"destination":{"network":"wanip","address":"","port":"443"},"target":"10.0.0.5","local-port":"443","descr":"orca:orca https","log":"1","created":{"time":"1"},"categories":""}}"#;
+    const GET_RULE: &str = r#"{"rule":{"sequence":"10","disabled":"0","interface":{"wan":{"value":"WAN","selected":1},"lan":{"value":"LAN","selected":0}},"protocol":{"tcp":{"value":"TCP","selected":1},"udp":{"value":"UDP","selected":0}},"destination":{"network":"wanip","address":"","port":"443"},"target":"10.0.0.5","local-port":"443","descr":"orca:orca https","log":"1","category":[],"tag":{},"associated-rule-id":"pass-1","created":{"time":"1"},"categories":""}}"#;
 
     type Route = (&'static str, String, u16, String);
 
@@ -1262,8 +1291,13 @@ mod tests {
     fn failed_health_after_create_deletes_the_new_rule() {
         let (got, calls) = compensation_calls("create-health");
         match got {
-            Err(OpnsenseError::Unhealthy { uuid, reason }) => {
+            Err(OpnsenseError::Unhealthy {
+                uuid,
+                compensated,
+                reason,
+            }) => {
                 assert_eq!(uuid, "bbbb-2222");
+                assert!(compensated);
                 assert!(
                     reason.contains("compensated: deleted created rule bbbb-2222"),
                     "{reason}"
@@ -1280,8 +1314,13 @@ mod tests {
     fn failed_apply_after_update_restores_the_snapshot() {
         let (got, calls) = compensation_calls("update-apply");
         match got {
-            Err(OpnsenseError::NotApplied { uuid, reason }) => {
+            Err(OpnsenseError::NotApplied {
+                uuid,
+                compensated,
+                reason,
+            }) => {
                 assert_eq!(uuid, UUID);
+                assert!(compensated);
                 assert!(
                     reason.contains("compensated: restored rule aaaa-1111"),
                     "{reason}"
@@ -1299,6 +1338,8 @@ mod tests {
         assert_eq!(body["rule"]["protocol"], "tcp");
         assert_eq!(body["rule"]["target"], "10.0.0.5");
         assert_eq!(body["rule"]["log"], "1");
+        assert_eq!(body["rule"]["category"], "");
+        assert_eq!(body["rule"]["tag"], "");
         assert!(body["rule"].get("created").is_none());
         assert!(body["rule"].get("categories").is_none());
         assert!(body["rule"]["destination"].get("address").is_none());
@@ -1308,9 +1349,14 @@ mod tests {
     fn failed_health_after_delete_re_adds_the_snapshot() {
         let (got, calls) = compensation_calls("delete-health");
         match got {
-            Err(OpnsenseError::Unhealthy { reason, .. }) => {
+            Err(OpnsenseError::Unhealthy {
+                compensated,
+                reason,
+                ..
+            }) => {
+                assert!(compensated);
                 assert!(
-                    reason.contains("compensated: re-added deleted rule"),
+                    reason.contains("re-added deleted rule from snapshot as new uuid bbbb-2222"),
                     "{reason}"
                 )
             }
@@ -1323,6 +1369,28 @@ mod tests {
         let body: Value = plugin_toolkit::serde_json::from_str(&readd.2).unwrap();
         assert_eq!(body["rule"]["descr"], OWNED);
         assert_eq!(body["rule"]["destination"]["port"], "443");
+        assert!(body["rule"].get("associated-rule-id").is_none());
+    }
+
+    #[test]
+    fn flatten_rule_maps_selected_options_arrays_and_empties() {
+        let raw = json!({
+            "category": {
+                "c1": {"value": "web", "selected": 1},
+                "c2": {"value": "db", "selected": 0},
+                "c3": {"value": "lan", "selected": "1"}
+            },
+            "empty_list": [],
+            "list": ["a", "b"],
+            "nothing": {},
+            "plain": "x"
+        });
+        let flat = flatten_rule(&raw);
+        assert_eq!(flat["category"], "c1,c3");
+        assert_eq!(flat["empty_list"], "");
+        assert_eq!(flat["list"], "a,b");
+        assert_eq!(flat["nothing"], "");
+        assert_eq!(flat["plain"], "x");
     }
 
     #[test]
@@ -1337,7 +1405,7 @@ mod tests {
             async |c, cfg| set_port_forward(c, cfg, desired("10.0.0.5"), exec()).await,
         );
         assert!(
-            matches!(got, Err(OpnsenseError::NotApplied { reason, .. }) if reason.contains("compensation FAILED"))
+            matches!(got, Err(OpnsenseError::NotApplied { compensated: false, reason, .. }) if reason.contains("compensation FAILED"))
         );
     }
 
