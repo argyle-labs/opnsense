@@ -542,6 +542,50 @@ async fn compensate(client: &reqwest::Client, cfg: &Config, undo: Undo) -> (bool
     }
 }
 
+async fn remove_unidentified(
+    client: &reqwest::Client,
+    cfg: &Config,
+    description: &str,
+) -> OpnsenseError {
+    let found = match list_port_forwards(client, cfg).await {
+        Ok(rules) => single(&rules, description),
+        Err(e) => Err(e),
+    };
+    let outcome = match found {
+        Ok(Some(rule)) => match rule_uuid(&rule) {
+            Ok(uuid) => post_write(
+                client,
+                &cfg.api_url(&format!("firewall/d_nat/del_rule/{uuid}")),
+                &json!({}),
+            )
+            .await
+            .map(|_| uuid.to_string()),
+            Err(e) => Err(e),
+        },
+        Ok(None) => Err(OpnsenseError::NotFound {
+            kind: "port forward",
+            selector: description.to_string(),
+        }),
+        Err(e) => Err(e),
+    };
+    match outcome {
+        Ok(uuid) => OpnsenseError::NotApplied {
+            uuid: uuid.clone(),
+            compensated: true,
+            reason: format!(
+                "add_rule saved without returning a uuid; deleted the saved rule {uuid} ({description:?}) before applying"
+            ),
+        },
+        Err(e) => OpnsenseError::NotApplied {
+            uuid: String::new(),
+            compensated: false,
+            reason: format!(
+                "add_rule saved without returning a uuid and the staged rule {description:?} could not be removed: {e}"
+            ),
+        },
+    }
+}
+
 fn require_wan(interfaces: &[&str], allow_unprotected: bool) -> Result<(), OpnsenseError> {
     match interfaces.iter().find(|i| **i != "wan") {
         Some(i) if !allow_unprotected => Err(invalid(format!(
@@ -670,9 +714,11 @@ pub async fn set_port_forward(
             (uuid.clone(), Undo::Restore(uuid, before))
         }
         None => {
-            let uuid = post_write(client, &cfg.api_url("firewall/d_nat/add_rule"), &body)
-                .await?
-                .ok_or_else(|| OpnsenseError::Malformed("add_rule returned no uuid".into()))?;
+            let Some(uuid) =
+                post_write(client, &cfg.api_url("firewall/d_nat/add_rule"), &body).await?
+            else {
+                return Err(remove_unidentified(client, cfg, &desired.description).await);
+            };
             (uuid.clone(), Undo::Delete(uuid))
         }
     };
@@ -1391,6 +1437,85 @@ mod tests {
         assert_eq!(flat["list"], "a,b");
         assert_eq!(flat["nothing"], "");
         assert_eq!(flat["plain"], "x");
+    }
+
+    #[test]
+    fn add_without_uuid_removes_the_saved_rule_by_description() {
+        let mock = |method: &str, url: &str, n: usize| -> (u16, String) {
+            match (method, url) {
+                ("GET", u) if u.ends_with(SEARCH) && n == 0 => (200, search(&[])),
+                ("GET", u) if u.ends_with(SEARCH) => (200, search(&[row(OWNED, "10.0.0.5")])),
+                ("POST", u) if u.ends_with("/add_rule") => (200, UPDATED.into()),
+                ("POST", u) if u.ends_with("/del_rule/aaaa-1111") => (200, DELETED.into()),
+                _ => panic!("unexpected {method} {url}"),
+            }
+        };
+        let (got, p) = stateful(mock);
+        match got {
+            Err(OpnsenseError::NotApplied {
+                uuid, compensated, ..
+            }) => {
+                assert_eq!(uuid, UUID);
+                assert!(compensated);
+            }
+            other => panic!("expected NotApplied, got {other:?}"),
+        }
+        assert!(p.contains(&"POST firewall/d_nat/del_rule/aaaa-1111".to_string()));
+        assert!(!p.iter().any(|x| x.ends_with("d_nat/apply")));
+    }
+
+    #[test]
+    fn add_without_uuid_and_no_match_is_not_compensated() {
+        let mock = |method: &str, url: &str, _n: usize| -> (u16, String) {
+            match (method, url) {
+                ("GET", u) if u.ends_with(SEARCH) => (200, search(&[])),
+                ("POST", u) if u.ends_with("/add_rule") => (200, UPDATED.into()),
+                _ => panic!("unexpected {method} {url}"),
+            }
+        };
+        let (got, _) = stateful(mock);
+        assert!(matches!(
+            got,
+            Err(OpnsenseError::NotApplied { compensated: false, reason, .. }) if reason.contains(OWNED)
+        ));
+    }
+
+    fn stateful(
+        respond: impl Fn(&str, &str, usize) -> (u16, String) + Send + Sync + 'static,
+    ) -> (Result<NatWritePlan, OpnsenseError>, Vec<String>) {
+        let calls: Calls = Arc::default();
+        let log = calls.clone();
+        let sink = Box::new(move |_cap: &str, op: &str| {
+            let req: HttpRequest = plugin_toolkit::serde_json::from_str(op).unwrap();
+            let mut log = log.lock().unwrap();
+            let seen = log
+                .iter()
+                .filter(|(m, u, _)| *m == req.method && *u == req.url)
+                .count();
+            log.push((req.method.clone(), req.url.clone(), String::new()));
+            let (status, body) = respond(&req.method, &req.url, seen);
+            Ok::<String, String>(
+                plugin_toolkit::serde_json::to_string(&HttpResponse {
+                    status,
+                    headers: vec![],
+                    body: body.into_bytes(),
+                })
+                .unwrap(),
+            )
+        });
+        let cfg = Config::new("https://10.0.0.1", "k", "s").insecure(true);
+        let result = plugin_toolkit::capsink::with_cap_sink(sink, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let client = cfg.build_client()?;
+                set_port_forward(&client, &cfg, desired("10.0.0.5"), exec()).await
+            })
+        });
+        let calls = calls.lock().unwrap().clone();
+        (result, paths(&calls))
     }
 
     #[test]

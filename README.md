@@ -82,7 +82,9 @@ Safety:
 
 - OPNsense has no rollback for NAT (its savepoint/rollback timer restores filter rules only), so orca compensates itself and `rollback_protected` is always `false`. Before changing or deleting a rule it snapshots it with `get_rule`. If apply or the post-apply health check fails, orca undoes the write — deletes a created rule, restores an updated rule from the snapshot, or re-adds a deleted one — re-applies, and reports whether that worked. The undo needs the API reachable; if the change cut orca off, it fails and says so. Errors carry `compensated: true|false`.
 - The health check only proves the OPNsense API still answers orca. It does not test that the forward works from the WAN side; there is no TCP probe in the plugin toolkit yet, so verify external reachability separately.
-- Undoing a delete re-adds the rule from the snapshot, which gives it a **new uuid** (reported in the error). Its linked filter rule id (`associated-rule-id`) is not copied; OPNsense re-links it from the `filter_rule` setting.
+- Undoing a delete re-adds the rule from the snapshot, which gives it a **new uuid** (reported in the error). `associated-rule-id` is a deprecated field OPNsense always clears, so it is dropped. The rule's filter behaviour comes from its `pass` setting (Pass / Register rule / Manual), which is restored from the snapshot.
+- `firewall/d_nat/apply` applies the whole NAT configuration, including any other changes staged in the GUI; the compensation re-apply does too.
+- If `add_rule` saves but returns no uuid, orca finds the staged rule by its `orca:` description and deletes it before applying (reported as `compensated: true`); if it can't, the error names the description and says `compensated: false`.
 - Only an exact `wan` counts as WAN. If the current or desired interface is anything else (`opt*` and multi-interface rules included), `allow_unprotected` is required.
 - On non-WAN interfaces, forwards touching 22/80/443 (plus the endpoint's `management_ports`, comma-separated) are refused unless the destination is a literal host address that is not a firewall interface address.
 
