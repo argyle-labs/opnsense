@@ -144,7 +144,6 @@ pub struct ApplyResult {
 
 #[derive(Debug, Clone, Default)]
 pub struct WriteOptions {
-    pub execute: bool,
     pub adopt: bool,
     pub allow_unprotected: bool,
     pub management_ports: Vec<u16>,
@@ -571,7 +570,6 @@ pub async fn plan_set(
     cfg: &Config,
     mut desired: PortForward,
     adopt: bool,
-    execute: bool,
     management_ports: &[u16],
 ) -> Result<NatWritePlan, OpnsenseError> {
     validate(&desired)?;
@@ -604,7 +602,6 @@ pub async fn plan_set(
             action,
             current,
             desired: Some(desired),
-            dry_run: !execute,
             executed: false,
             steps,
         },
@@ -618,16 +615,8 @@ pub async fn set_port_forward(
     desired: PortForward,
     opts: WriteOptions,
 ) -> Result<NatWritePlan, OpnsenseError> {
-    let mut out = plan_set(
-        client,
-        cfg,
-        desired,
-        opts.adopt,
-        opts.execute,
-        &opts.management_ports,
-    )
-    .await?;
-    if !opts.execute || out.plan.action == Action::Unchanged {
+    let mut out = plan_set(client, cfg, desired, opts.adopt, &opts.management_ports).await?;
+    if out.plan.action == Action::Unchanged {
         return Ok(out);
     }
     let Some(desired) = out.plan.desired.clone() else {
@@ -673,7 +662,6 @@ pub async fn plan_delete(
     cfg: &Config,
     description: &str,
     adopt: bool,
-    execute: bool,
 ) -> Result<NatWritePlan, OpnsenseError> {
     validate_description(description)?;
     let current = find_owned(client, cfg, description, adopt).await?;
@@ -695,7 +683,6 @@ pub async fn plan_delete(
             action,
             current,
             desired: None,
-            dry_run: !execute,
             executed: false,
             steps,
         },
@@ -709,8 +696,8 @@ pub async fn delete_port_forward(
     description: &str,
     opts: WriteOptions,
 ) -> Result<NatWritePlan, OpnsenseError> {
-    let mut out = plan_delete(client, cfg, description, opts.adopt, opts.execute).await?;
-    let Some(current) = out.plan.current.clone().filter(|_| opts.execute) else {
+    let mut out = plan_delete(client, cfg, description, opts.adopt).await?;
+    let Some(current) = out.plan.current.clone() else {
         return Ok(out);
     };
     let interfaces: Vec<&str> = current.interface.split(',').collect();
@@ -848,10 +835,7 @@ mod tests {
     }
 
     fn exec() -> WriteOptions {
-        WriteOptions {
-            execute: true,
-            ..WriteOptions::default()
-        }
+        WriteOptions::default()
     }
 
     fn paths(calls: &[Call]) -> Vec<String> {
@@ -886,11 +870,11 @@ mod tests {
     #[test]
     fn dry_run_reports_create_without_writing() {
         let (got, paths, _) = run(&search(&[]), vec![], async |c, cfg| {
-            set_port_forward(c, cfg, desired("10.0.0.5"), WriteOptions::default()).await
+            plan_set(c, cfg, desired("10.0.0.5"), false, &[]).await
         });
         let got = got.unwrap();
         assert_eq!(got.plan.action, Action::Create);
-        assert!(got.plan.dry_run && !got.plan.executed);
+        assert!(!got.plan.executed);
         assert_eq!(got.plan.desired.unwrap().description, OWNED);
         assert_eq!(got.plan.steps[0], "POST firewall/d_nat/add_rule");
         assert_eq!(paths, vec![search_path()]);
@@ -900,7 +884,7 @@ mod tests {
     fn dry_run_reports_update_with_current_and_desired() {
         let body = search(&[row(OWNED, "10.0.0.5")]);
         let (got, paths, _) = run(&body, vec![], async |c, cfg| {
-            set_port_forward(c, cfg, desired("10.0.0.6"), WriteOptions::default()).await
+            plan_set(c, cfg, desired("10.0.0.6"), false, &[]).await
         });
         let got = got.unwrap();
         assert_eq!(got.plan.action, Action::Update);
@@ -1057,11 +1041,11 @@ mod tests {
     fn delete_dry_run_and_executed_absent_are_noops() {
         let body = search(&[row(OWNED, "10.0.0.5")]);
         let (got, paths, _) = run(&body, vec![], async |c, cfg| {
-            delete_port_forward(c, cfg, "orca https", WriteOptions::default()).await
+            plan_delete(c, cfg, "orca https", false).await
         });
         let got = got.unwrap();
         assert_eq!(got.plan.action, Action::Delete);
-        assert!(got.plan.dry_run);
+        assert!(!got.plan.executed);
         assert_eq!(paths.len(), 1);
         let (got, paths, _) = run(&search(&[]), vec![], async |c, cfg| {
             delete_port_forward(c, cfg, "Anti-Lockout Rule", exec()).await
@@ -1178,9 +1162,7 @@ mod tests {
                 200,
                 IFCONFIG,
             )],
-            async |c, cfg| {
-                set_port_forward(c, cfg, lan_rule("10.0.0.1"), WriteOptions::default()).await
-            },
+            async |c, cfg| plan_set(c, cfg, lan_rule("10.0.0.1"), false, &[]).await,
         );
         assert!(
             matches!(got, Err(OpnsenseError::InvalidArgument(m)) if m.contains("firewall interface address"))
@@ -1198,9 +1180,7 @@ mod tests {
                 200,
                 IFCONFIG,
             )],
-            async |c, cfg| {
-                set_port_forward(c, cfg, lan_rule("10.0.0.9"), WriteOptions::default()).await
-            },
+            async |c, cfg| plan_set(c, cfg, lan_rule("10.0.0.9"), false, &[]).await,
         );
         assert_eq!(got.unwrap().plan.action, Action::Create);
         assert_eq!(paths.len(), 2);

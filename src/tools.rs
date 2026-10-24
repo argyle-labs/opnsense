@@ -24,9 +24,8 @@
 //!   - `opnsense.nat.forward.set`               upsert a port forward by description; undoes the write on a failed apply/health check
 //!   - `opnsense.nat.forward.delete`            delete a port forward by description; undoes the write on a failed apply/health check
 //!
-//! Every mutating verb needs the admin role (also for its dry run) and only
-//! writes with `--execute`, except the execute-gated `nat.forward.*` verbs,
-//! which apply unless the caller passes `dryRun`. A `set` or
+//! Every mutating verb needs the admin role (also for its dry run) and is
+//! execute-gated: it applies unless the caller passes `dryRun`. A `set` or
 //! `delete` that changes something is followed by a `reconfigure` of the
 //! owning module so the change takes effect. Imports flow through `plugin_toolkit::prelude::*`.
 
@@ -118,23 +117,23 @@ pub struct ReconfigureArgs {
     /// Module to apply: `unbound` (resolver) or `dhcp` (Kea DHCPv4).
     #[arg(long, value_enum)]
     pub module: Module,
-    /// Apply. Without it the verb only reports the plan.
-    #[arg(long)]
-    #[serde(default)]
-    pub execute: bool,
 }
 
-/// [MUTATES STATE with --execute] Apply staged settings for a module so they
-/// take effect. Dry run by default.
-#[orca_tool(domain = "opnsense", verb = "reconfigure", data_mutation = true)]
+/// [MUTATES STATE] Apply staged settings for a module so they
+/// take effect. `dryRun` previews.
+#[orca_tool(
+    domain = "opnsense",
+    verb = "reconfigure",
+    role = "admin",
+    data_mutation = true,
+    execute_gated = true
+)]
 async fn opnsense_reconfigure(args: ReconfigureArgs, ctx: &ToolCtx) -> Result<ReconfigurePlan> {
     require_admin(ctx)?;
-    let mut plan = crate::plan::reconfigure_plan(args.module, args.execute);
-    if args.execute {
-        let cfg = resolve_config(&args.name).await?;
-        let client = cfg.build_client()?;
-        plan.result = Some(crate::reconfigure(&client, &cfg, args.module).await?);
-    }
+    let mut plan = crate::plan::reconfigure_plan(args.module);
+    let cfg = resolve_config(&args.name).await?;
+    let client = cfg.build_client()?;
+    plan.result = Some(crate::reconfigure(&client, &cfg, args.module).await?);
     Ok(plan)
 }
 
@@ -173,19 +172,17 @@ pub struct HostOverrideArgs {
     /// Free-form description.
     #[arg(long, default_value = "")]
     pub description: String,
-    /// Apply. Without it the verb only reports the plan.
-    #[arg(long)]
-    #[serde(default)]
-    pub execute: bool,
 }
 
-/// [MUTATES STATE with --execute] Point `hostname.domain` at `server`,
+/// [MUTATES STATE] Point `hostname.domain` at `server`,
 /// upserting the matching override in place, then reconfigure Unbound. An
-/// unchanged override is left alone. Dry run by default.
+/// unchanged override is left alone. `dryRun` previews.
 #[orca_tool(
     domain = "opnsense",
     verb = "unbound.hostoverride.set",
-    data_mutation = true
+    role = "admin",
+    data_mutation = true,
+    execute_gated = true
 )]
 async fn opnsense_hostoverride_set(
     args: HostOverrideArgs,
@@ -203,8 +200,8 @@ async fn opnsense_hostoverride_set(
         server: args.server.clone(),
         description: args.description.clone(),
     };
-    let mut plan = crate::plan::host_override_set(&client, &cfg, desired, args.execute).await?;
-    if !args.execute || plan.action == Action::Unchanged {
+    let mut plan = crate::plan::host_override_set(&client, &cfg, desired).await?;
+    if plan.action == Action::Unchanged {
         return Ok(plan);
     }
     let record = crate::set_host_override(
@@ -234,18 +231,16 @@ pub struct HostOverrideKeyArgs {
     /// Domain part of the record (e.g. `example.com`).
     #[arg(long)]
     pub domain: String,
-    /// Apply. Without it the verb only reports the plan.
-    #[arg(long)]
-    #[serde(default)]
-    pub execute: bool,
 }
 
-/// [MUTATES STATE with --execute] Delete the host override for
-/// `(hostname, domain)`, then reconfigure Unbound. Dry run by default.
+/// [MUTATES STATE] Delete the host override for
+/// `(hostname, domain)`, then reconfigure Unbound. `dryRun` previews.
 #[orca_tool(
     domain = "opnsense",
     verb = "unbound.hostoverride.delete",
-    data_mutation = true
+    role = "admin",
+    data_mutation = true,
+    execute_gated = true
 )]
 async fn opnsense_hostoverride_delete(
     args: HostOverrideKeyArgs,
@@ -263,9 +258,8 @@ async fn hostoverride_delete(
     args: &HostOverrideKeyArgs,
 ) -> Result<WritePlan<HostOverride>> {
     let mut plan =
-        crate::plan::host_override_delete(client, cfg, &args.hostname, &args.domain, args.execute)
-            .await?;
-    if !args.execute || plan.action == Action::Absent {
+        crate::plan::host_override_delete(client, cfg, &args.hostname, &args.domain).await?;
+    if plan.action == Action::Absent {
         return Ok(plan);
     }
     crate::delete_host_override(client, cfg, &args.hostname, &args.domain).await?;
@@ -306,16 +300,18 @@ pub struct DotArgs {
     /// Free-form description.
     #[arg(long, default_value = "")]
     pub description: String,
-    /// Apply. Without it the verb only reports the plan.
-    #[arg(long)]
-    #[serde(default)]
-    pub execute: bool,
 }
 
-/// [MUTATES STATE with --execute] Upsert a DoT upstream keyed on
+/// [MUTATES STATE] Upsert a DoT upstream keyed on
 /// `(server, domain)`, then reconfigure Unbound. An unchanged upstream is left
-/// alone. Dry run by default.
-#[orca_tool(domain = "opnsense", verb = "unbound.dot.set", data_mutation = true)]
+/// alone. `dryRun` previews.
+#[orca_tool(
+    domain = "opnsense",
+    verb = "unbound.dot.set",
+    role = "admin",
+    data_mutation = true,
+    execute_gated = true
+)]
 async fn opnsense_dot_set(args: DotArgs, ctx: &ToolCtx) -> Result<WritePlan<DotUpstream>> {
     require_admin(ctx)?;
     let cfg = resolve_config(&args.name).await?;
@@ -329,8 +325,8 @@ async fn opnsense_dot_set(args: DotArgs, ctx: &ToolCtx) -> Result<WritePlan<DotU
         verify: args.verify.clone(),
         description: args.description.clone(),
     };
-    let mut plan = crate::plan::dot_set(&client, &cfg, desired, args.execute).await?;
-    if !args.execute || plan.action == Action::Unchanged {
+    let mut plan = crate::plan::dot_set(&client, &cfg, desired).await?;
+    if plan.action == Action::Unchanged {
         return Ok(plan);
     }
     let record = crate::set_dot(
@@ -360,15 +356,17 @@ pub struct DotKeyArgs {
     /// Zone the upstream forwards (empty = forward everything).
     #[arg(long, default_value = "")]
     pub domain: String,
-    /// Apply. Without it the verb only reports the plan.
-    #[arg(long)]
-    #[serde(default)]
-    pub execute: bool,
 }
 
-/// [MUTATES STATE with --execute] Delete the DoT upstream for
-/// `(server, domain)`, then reconfigure Unbound. Dry run by default.
-#[orca_tool(domain = "opnsense", verb = "unbound.dot.delete", data_mutation = true)]
+/// [MUTATES STATE] Delete the DoT upstream for
+/// `(server, domain)`, then reconfigure Unbound. `dryRun` previews.
+#[orca_tool(
+    domain = "opnsense",
+    verb = "unbound.dot.delete",
+    role = "admin",
+    data_mutation = true,
+    execute_gated = true
+)]
 async fn opnsense_dot_delete(args: DotKeyArgs, ctx: &ToolCtx) -> Result<WritePlan<DotUpstream>> {
     require_admin(ctx)?;
     let cfg = resolve_config(&args.name).await?;
@@ -381,9 +379,8 @@ async fn dot_delete(
     cfg: &Config,
     args: &DotKeyArgs,
 ) -> Result<WritePlan<DotUpstream>> {
-    let mut plan =
-        crate::plan::dot_delete(client, cfg, &args.server, &args.domain, args.execute).await?;
-    if !args.execute || plan.action == Action::Absent {
+    let mut plan = crate::plan::dot_delete(client, cfg, &args.server, &args.domain).await?;
+    if plan.action == Action::Absent {
         return Ok(plan);
     }
     crate::delete_dot(client, cfg, &args.server, &args.domain).await?;
@@ -424,19 +421,17 @@ pub struct ReservationArgs {
     /// Free-form description.
     #[arg(long, default_value = "")]
     pub description: String,
-    /// Apply. Without it the verb only reports the plan.
-    #[arg(long)]
-    #[serde(default)]
-    pub execute: bool,
 }
 
-/// [MUTATES STATE with --execute] Upsert a MAC->IP reservation keyed on the
-/// MAC, then reconfigure Kea DHCP. An unchanged reservation is left alone. Dry
-/// run by default.
+/// [MUTATES STATE] Upsert a MAC->IP reservation keyed on the
+/// MAC, then reconfigure Kea DHCP. An unchanged reservation is left alone.
+/// `dryRun` previews.
 #[orca_tool(
     domain = "opnsense",
     verb = "dhcp.reservation.set",
-    data_mutation = true
+    role = "admin",
+    data_mutation = true,
+    execute_gated = true
 )]
 async fn opnsense_reservation_set(
     args: ReservationArgs,
@@ -453,8 +448,8 @@ async fn opnsense_reservation_set(
         hostname: args.hostname.clone(),
         description: args.description.clone(),
     };
-    let mut plan = crate::plan::reservation_set(&client, &cfg, desired, args.execute).await?;
-    if !args.execute || plan.action == Action::Unchanged {
+    let mut plan = crate::plan::reservation_set(&client, &cfg, desired).await?;
+    if plan.action == Action::Unchanged {
         return Ok(plan);
     }
     let record = crate::set_reservation(
@@ -481,18 +476,16 @@ pub struct ReservationKeyArgs {
     /// The MAC address whose reservation to delete.
     #[arg(long)]
     pub hw_address: String,
-    /// Apply. Without it the verb only reports the plan.
-    #[arg(long)]
-    #[serde(default)]
-    pub execute: bool,
 }
 
-/// [MUTATES STATE with --execute] Delete the reservation for a MAC, then
-/// reconfigure Kea DHCP. Dry run by default.
+/// [MUTATES STATE] Delete the reservation for a MAC, then
+/// reconfigure Kea DHCP. `dryRun` previews.
 #[orca_tool(
     domain = "opnsense",
     verb = "dhcp.reservation.delete",
-    data_mutation = true
+    role = "admin",
+    data_mutation = true,
+    execute_gated = true
 )]
 async fn opnsense_reservation_delete(
     args: ReservationKeyArgs,
@@ -509,9 +502,8 @@ async fn reservation_delete(
     cfg: &Config,
     args: &ReservationKeyArgs,
 ) -> Result<WritePlan<Reservation>> {
-    let mut plan =
-        crate::plan::reservation_delete(client, cfg, &args.hw_address, args.execute).await?;
-    if !args.execute || plan.action == Action::Absent {
+    let mut plan = crate::plan::reservation_delete(client, cfg, &args.hw_address).await?;
+    if plan.action == Action::Absent {
         return Ok(plan);
     }
     crate::delete_reservation(client, cfg, &args.hw_address).await?;
@@ -593,6 +585,7 @@ async fn opnsense_netflow_health(args: EndpointArgs, _ctx: &ToolCtx) -> Result<N
     domain = "opnsense",
     verb = "netflow.repair",
     role = "admin",
+    data_mutation = true,
     execute_gated = true
 )]
 async fn opnsense_netflow_repair(args: EndpointArgs, ctx: &ToolCtx) -> Result<NetflowRepair> {
@@ -715,7 +708,6 @@ async fn opnsense_nat_forward_set(args: NatForwardArgs, ctx: &ToolCtx) -> Result
     crate::nat::validate(&desired)?;
     crate::nat::guard_management(&desired, &management_ports)?;
     let opts = WriteOptions {
-        execute: true,
         adopt: args.adopt,
         allow_unprotected: args.allow_unprotected,
         management_ports,
@@ -766,7 +758,6 @@ async fn opnsense_nat_forward_delete(
     let cfg = resolve_config(&args.name).await?;
     let client = cfg.build_client()?;
     let opts = WriteOptions {
-        execute: true,
         adopt: args.adopt,
         allow_unprotected: args.allow_unprotected,
         management_ports: Vec::new(),
@@ -831,7 +822,6 @@ mod tests {
                         ReconfigureArgs {
                             name: n(),
                             module: Module::Unbound,
-                            execute: false,
                         },
                         &c,
                     )
@@ -846,7 +836,6 @@ mod tests {
                             server: "10.0.0.5".into(),
                             rr: "A".into(),
                             description: String::new(),
-                            execute: false,
                         },
                         &c,
                     )
@@ -858,7 +847,6 @@ mod tests {
                             name: n(),
                             hostname: "h".into(),
                             domain: "d".into(),
-                            execute: false,
                         },
                         &c,
                     )
@@ -873,7 +861,6 @@ mod tests {
                             domain: String::new(),
                             verify: String::new(),
                             description: String::new(),
-                            execute: false,
                         },
                         &c,
                     )
@@ -885,7 +872,6 @@ mod tests {
                             name: n(),
                             server: "9.9.9.9".into(),
                             domain: String::new(),
-                            execute: false,
                         },
                         &c,
                     )
@@ -900,7 +886,6 @@ mod tests {
                             hw_address: "aa:bb:cc:dd:ee:ff".into(),
                             hostname: String::new(),
                             description: String::new(),
-                            execute: false,
                         },
                         &c,
                     )
@@ -911,7 +896,6 @@ mod tests {
                         ReservationKeyArgs {
                             name: n(),
                             hw_address: "aa:bb:cc:dd:ee:ff".into(),
-                            execute: false,
                         },
                         &c,
                     )
@@ -965,14 +949,13 @@ mod tests {
     }
 
     #[test]
-    fn hostoverride_delete_execute_on_absent_is_a_noop() {
+    fn hostoverride_delete_on_absent_is_a_noop() {
         absent_noop(get_only(|c, cfg| {
             Box::pin(async move {
                 let args = HostOverrideKeyArgs {
                     name: "fw".into(),
                     hostname: "h".into(),
                     domain: "d".into(),
-                    execute: true,
                 };
                 hostoverride_delete(&c, &cfg, &args).await
             })
@@ -980,14 +963,13 @@ mod tests {
     }
 
     #[test]
-    fn dot_delete_execute_on_absent_is_a_noop() {
+    fn dot_delete_on_absent_is_a_noop() {
         absent_noop(get_only(|c, cfg| {
             Box::pin(async move {
                 let args = DotKeyArgs {
                     name: "fw".into(),
                     server: "9.9.9.9".into(),
                     domain: String::new(),
-                    execute: true,
                 };
                 dot_delete(&c, &cfg, &args).await
             })
@@ -995,13 +977,12 @@ mod tests {
     }
 
     #[test]
-    fn reservation_delete_execute_on_absent_is_a_noop() {
+    fn reservation_delete_on_absent_is_a_noop() {
         absent_noop(get_only(|c, cfg| {
             Box::pin(async move {
                 let args = ReservationKeyArgs {
                     name: "fw".into(),
                     hw_address: "aa:bb:cc:dd:ee:ff".into(),
-                    execute: true,
                 };
                 reservation_delete(&c, &cfg, &args).await
             })
