@@ -29,7 +29,6 @@ pub struct WritePlan<T> {
     pub current: Option<T>,
     /// The record after the write; `None` for deletes.
     pub desired: Option<T>,
-    pub dry_run: bool,
     pub executed: bool,
     pub steps: Vec<String>,
 }
@@ -37,7 +36,6 @@ pub struct WritePlan<T> {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ReconfigurePlan {
     pub module: Module,
-    pub dry_run: bool,
     pub steps: Vec<String>,
     /// The reconfigure response, when executed.
     pub result: Option<plugin_toolkit::serde_json::Value>,
@@ -50,7 +48,6 @@ pub fn reconfigure_step(module: Module) -> String {
 pub fn reconfigure_plan(module: Module) -> ReconfigurePlan {
     ReconfigurePlan {
         module,
-        dry_run: false,
         steps: vec![reconfigure_step(module)],
         result: None,
     }
@@ -73,7 +70,6 @@ fn upsert<T>(
         action,
         current,
         desired: Some(desired),
-        dry_run: false,
         executed: false,
         steps,
     }
@@ -88,7 +84,6 @@ fn delete<T>(current: Option<T>, del: impl Fn(&T) -> String, module: Module) -> 
         action,
         current,
         desired: None,
-        dry_run: false,
         executed: false,
         steps,
     }
@@ -312,7 +307,7 @@ mod tests {
                 "POST unbound/service/reconfigure"
             ]
         );
-        assert!(!p.dry_run && !p.executed);
+        assert!(!p.executed);
 
         let p = read_only(&[("search_host_override", HOSTS)], |c, cfg| {
             Box::pin(async move { host_override_set(&c, &cfg, host("10.0.0.5")).await })
@@ -402,7 +397,7 @@ mod tests {
     #[test]
     fn reconfigure_plan_lists_the_call() {
         let p = reconfigure_plan(Module::Dhcp);
-        assert!(!p.dry_run && p.result.is_none());
+        assert!(p.result.is_none());
         assert_eq!(p.steps, ["POST kea/service/reconfigure"]);
     }
 }

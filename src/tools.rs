@@ -573,6 +573,7 @@ async fn opnsense_netflow_health(args: EndpointArgs, _ctx: &ToolCtx) -> Result<N
     domain = "opnsense",
     verb = "netflow.repair",
     role = "admin",
+    data_mutation = true,
     execute_gated = true
 )]
 async fn opnsense_netflow_repair(args: EndpointArgs, ctx: &ToolCtx) -> Result<NetflowRepair> {
