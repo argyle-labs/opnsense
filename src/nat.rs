@@ -430,19 +430,24 @@ async fn savepoint(
     }
 }
 
-fn status_ok(v: &Value) -> bool {
+const APPLIED: &str = "OK";
+const ROLLBACK_CANCELLED: &str = "";
+const REVERTED: &str = "ok";
+
+fn status_is(v: &Value, expected: &str) -> bool {
     v.get("status")
         .and_then(Value::as_str)
-        .is_some_and(|s| s.trim().eq_ignore_ascii_case("ok"))
+        .is_some_and(|s| s.trim() == expected)
 }
 
 async fn post_ok(
     client: &reqwest::Client,
     cfg: &Config,
     path: &str,
+    expected: &str,
 ) -> Result<Value, OpnsenseError> {
     let v = post_json(client, &cfg.api_url(path), &json!({})).await?;
-    if status_ok(&v) {
+    if status_is(&v, expected) {
         Ok(v)
     } else {
         Err(OpnsenseError::Rejected {
@@ -453,7 +458,14 @@ async fn post_ok(
 }
 
 async fn revert(client: &reqwest::Client, cfg: &Config, revision: &str) -> String {
-    match post_ok(client, cfg, &format!("firewall/d_nat/revert/{revision}")).await {
+    match post_ok(
+        client,
+        cfg,
+        &format!("firewall/d_nat/revert/{revision}"),
+        REVERTED,
+    )
+    .await
+    {
         Ok(_) => format!("reverted to savepoint {revision}"),
         Err(e) => format!("NOT reverted to savepoint {revision}: {e}"),
     }
@@ -484,7 +496,7 @@ async fn guarded_write(
         }
     };
     let Some(rev) = revision else {
-        let status = post_ok(client, cfg, "firewall/d_nat/apply")
+        let status = post_ok(client, cfg, "firewall/d_nat/apply", APPLIED)
             .await
             .map_err(|e| OpnsenseError::NotApplied {
                 uuid: uuid.clone().unwrap_or_default(),
@@ -499,7 +511,7 @@ async fn guarded_write(
             },
         ));
     };
-    let status = match post_ok(client, cfg, &format!("firewall/d_nat/apply/{rev}")).await {
+    let status = match post_ok(client, cfg, &format!("firewall/d_nat/apply/{rev}"), APPLIED).await {
         Ok(s) => s,
         Err(e) => {
             return Err(OpnsenseError::NotApplied {
@@ -518,6 +530,7 @@ async fn guarded_write(
         client,
         cfg,
         &format!("firewall/d_nat/cancel_rollback/{rev}"),
+        ROLLBACK_CANCELLED,
     )
     .await
     {
@@ -836,7 +849,8 @@ mod tests {
     const REV: &str = "1729700000.12";
     const SAVEPOINT: &str = r#"{"status":"ok","retention":"60","revision":"1729700000.12"}"#;
     const SAVED: &str = r#"{"result":"saved","uuid":"bbbb-2222"}"#;
-    const OK: &str = r#"{"status":"OK"}"#;
+    const OK: &str = "{\"status\":\"OK\\n\\n\"}";
+    const CANCELLED: &str = r#"{"status":"\n\n"}"#;
     const OWNED: &str = "orca:orca https";
 
     type Route = (&'static str, String, u16, String);
@@ -854,7 +868,7 @@ mod tests {
                 "POST",
                 &format!("/firewall/d_nat/cancel_rollback/{REV}"),
                 200,
-                OK,
+                CANCELLED,
             ),
         ]
     }
@@ -1366,8 +1380,26 @@ mod tests {
     }
 
     #[test]
+    fn status_text_matches_configd_exactly() {
+        assert!(status_is(&json!({"status": "OK\n\n"}), APPLIED));
+        assert!(!status_is(&json!({"status": "ok"}), APPLIED));
+        assert!(!status_is(&json!({"status": "Error (1)"}), APPLIED));
+        assert!(status_is(&json!({"status": "\n\n"}), ROLLBACK_CANCELLED));
+        assert!(!status_is(
+            &json!({"status": "Execute error"}),
+            ROLLBACK_CANCELLED
+        ));
+        assert!(!status_is(&json!({}), ROLLBACK_CANCELLED));
+        assert!(status_is(&json!({"status": "ok"}), REVERTED));
+        assert!(!status_is(
+            &json!({"status": "unknown (or removed) savepoint"}),
+            REVERTED
+        ));
+    }
+
+    #[test]
     fn cancel_rollback_failure_reports_rollback_armed() {
-        for (status, body) in [(200, r#"{"status":"error"}"#), (500, "boom")] {
+        for (status, body) in [(200, r#"{"status":"Execute error"}"#), (500, "boom")] {
             let (got, _, _) = run(
                 &search(&[]),
                 vec![
