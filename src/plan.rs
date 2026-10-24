@@ -1,7 +1,7 @@
-//! Dry-run plans for the DNS/DHCP write verbs.
+//! Write plans for the DNS/DHCP write verbs.
 //!
-//! Each verb reads the current rows, decides what it would do, and only
-//! writes with `execute`. An unchanged record is not rewritten and its
+//! Each verb reads the current rows and decides what it will do; the plan is
+//! returned with the result. An unchanged record is not rewritten and its
 //! module is not reconfigured.
 
 use plugin_toolkit::reqwest;
@@ -47,10 +47,10 @@ pub fn reconfigure_step(module: Module) -> String {
     format!("POST {}/service/reconfigure", module.service_module())
 }
 
-pub fn reconfigure_plan(module: Module, execute: bool) -> ReconfigurePlan {
+pub fn reconfigure_plan(module: Module) -> ReconfigurePlan {
     ReconfigurePlan {
         module,
-        dry_run: !execute,
+        dry_run: false,
         steps: vec![reconfigure_step(module)],
         result: None,
     }
@@ -63,7 +63,6 @@ fn upsert<T>(
     write: String,
     add: String,
     module: Module,
-    execute: bool,
 ) -> WritePlan<T> {
     let (action, steps) = match &current {
         Some(c) if same(c, &desired) => (Action::Unchanged, Vec::new()),
@@ -74,18 +73,13 @@ fn upsert<T>(
         action,
         current,
         desired: Some(desired),
-        dry_run: !execute,
+        dry_run: false,
         executed: false,
         steps,
     }
 }
 
-fn delete<T>(
-    current: Option<T>,
-    del: impl Fn(&T) -> String,
-    module: Module,
-    execute: bool,
-) -> WritePlan<T> {
+fn delete<T>(current: Option<T>, del: impl Fn(&T) -> String, module: Module) -> WritePlan<T> {
     let (action, steps) = match &current {
         Some(c) => (Action::Delete, vec![del(c), reconfigure_step(module)]),
         None => (Action::Absent, Vec::new()),
@@ -94,7 +88,7 @@ fn delete<T>(
         action,
         current,
         desired: None,
-        dry_run: !execute,
+        dry_run: false,
         executed: false,
         steps,
     }
@@ -108,7 +102,6 @@ pub async fn host_override_set(
     client: &reqwest::Client,
     cfg: &Config,
     desired: HostOverride,
-    execute: bool,
 ) -> Result<WritePlan<HostOverride>, OpnsenseError> {
     let current = list_host_overrides(client, cfg)
         .await?
@@ -130,7 +123,6 @@ pub async fn host_override_set(
         write,
         "POST unbound/settings/add_host_override".into(),
         Module::Unbound,
-        execute,
     ))
 }
 
@@ -139,7 +131,6 @@ pub async fn host_override_delete(
     cfg: &Config,
     hostname: &str,
     domain: &str,
-    execute: bool,
 ) -> Result<WritePlan<HostOverride>, OpnsenseError> {
     let current = list_host_overrides(client, cfg)
         .await?
@@ -154,7 +145,6 @@ pub async fn host_override_delete(
             )
         },
         Module::Unbound,
-        execute,
     ))
 }
 
@@ -162,7 +152,6 @@ pub async fn dot_set(
     client: &reqwest::Client,
     cfg: &Config,
     desired: DotUpstream,
-    execute: bool,
 ) -> Result<WritePlan<DotUpstream>, OpnsenseError> {
     let current = list_dot(client, cfg)
         .await?
@@ -184,7 +173,6 @@ pub async fn dot_set(
         write,
         "POST unbound/settings/add_dot".into(),
         Module::Unbound,
-        execute,
     ))
 }
 
@@ -193,7 +181,6 @@ pub async fn dot_delete(
     cfg: &Config,
     server: &str,
     domain: &str,
-    execute: bool,
 ) -> Result<WritePlan<DotUpstream>, OpnsenseError> {
     let current = list_dot(client, cfg)
         .await?
@@ -203,7 +190,6 @@ pub async fn dot_delete(
         current,
         |c| format!("POST unbound/settings/del_dot/{}", uuid_of(&c.uuid)),
         Module::Unbound,
-        execute,
     ))
 }
 
@@ -211,7 +197,6 @@ pub async fn reservation_set(
     client: &reqwest::Client,
     cfg: &Config,
     desired: Reservation,
-    execute: bool,
 ) -> Result<WritePlan<Reservation>, OpnsenseError> {
     let current = list_reservations(client, cfg)
         .await?
@@ -233,7 +218,6 @@ pub async fn reservation_set(
         write,
         "POST kea/dhcpv4/add_reservation".into(),
         Module::Dhcp,
-        execute,
     ))
 }
 
@@ -241,7 +225,6 @@ pub async fn reservation_delete(
     client: &reqwest::Client,
     cfg: &Config,
     hw_address: &str,
-    execute: bool,
 ) -> Result<WritePlan<Reservation>, OpnsenseError> {
     let current = list_reservations(client, cfg)
         .await?
@@ -251,7 +234,6 @@ pub async fn reservation_delete(
         current,
         |c| format!("POST kea/dhcpv4/del_reservation/{}", uuid_of(&c.uuid)),
         Module::Dhcp,
-        execute,
     ))
 }
 
@@ -319,7 +301,7 @@ mod tests {
     #[test]
     fn host_override_plans_update_unchanged_and_create_without_writing() {
         let p = read_only(&[("search_host_override", HOSTS)], |c, cfg| {
-            Box::pin(async move { host_override_set(&c, &cfg, host("10.0.0.6"), false).await })
+            Box::pin(async move { host_override_set(&c, &cfg, host("10.0.0.6")).await })
         })
         .unwrap();
         assert_eq!(p.action, Action::Update);
@@ -330,17 +312,17 @@ mod tests {
                 "POST unbound/service/reconfigure"
             ]
         );
-        assert!(p.dry_run && !p.executed);
+        assert!(!p.dry_run && !p.executed);
 
         let p = read_only(&[("search_host_override", HOSTS)], |c, cfg| {
-            Box::pin(async move { host_override_set(&c, &cfg, host("10.0.0.5"), false).await })
+            Box::pin(async move { host_override_set(&c, &cfg, host("10.0.0.5")).await })
         })
         .unwrap();
         assert_eq!(p.action, Action::Unchanged);
         assert!(p.steps.is_empty());
 
         let p = read_only(&[("search_host_override", r#"{"rows":[]}"#)], |c, cfg| {
-            Box::pin(async move { host_override_set(&c, &cfg, host("10.0.0.5"), false).await })
+            Box::pin(async move { host_override_set(&c, &cfg, host("10.0.0.5")).await })
         })
         .unwrap();
         assert_eq!(p.action, Action::Create);
@@ -349,21 +331,19 @@ mod tests {
     #[test]
     fn deletes_plan_delete_or_absent() {
         let p = read_only(&[("search_host_override", HOSTS)], |c, cfg| {
-            Box::pin(
-                async move { host_override_delete(&c, &cfg, "gitea", "example.com", false).await },
-            )
+            Box::pin(async move { host_override_delete(&c, &cfg, "gitea", "example.com").await })
         })
         .unwrap();
         assert_eq!(p.action, Action::Delete);
         assert_eq!(p.steps[0], "POST unbound/settings/del_host_override/h1");
         let p = read_only(&[("search_dot", DOTS)], |c, cfg| {
-            Box::pin(async move { dot_delete(&c, &cfg, "1.1.1.1", "", false).await })
+            Box::pin(async move { dot_delete(&c, &cfg, "1.1.1.1", "").await })
         })
         .unwrap();
         assert_eq!(p.action, Action::Absent);
         assert!(p.steps.is_empty());
         let p = read_only(&[("search_reservation", RES)], |c, cfg| {
-            Box::pin(async move { reservation_delete(&c, &cfg, "aa:bb:cc:dd:ee:ff", false).await })
+            Box::pin(async move { reservation_delete(&c, &cfg, "aa:bb:cc:dd:ee:ff").await })
         })
         .unwrap();
         assert_eq!(p.action, Action::Delete);
@@ -383,7 +363,7 @@ mod tests {
         };
         let d2 = dot.clone();
         let p = read_only(&[("search_dot", DOTS)], |c, cfg| {
-            Box::pin(async move { dot_set(&c, &cfg, d2, false).await })
+            Box::pin(async move { dot_set(&c, &cfg, d2).await })
         })
         .unwrap();
         assert_eq!(p.action, Action::Unchanged);
@@ -396,7 +376,6 @@ mod tests {
                         verify: String::new(),
                         ..dot
                     },
-                    false,
                 )
                 .await
             })
@@ -413,7 +392,7 @@ mod tests {
             description: String::new(),
         };
         let p = read_only(&[("search_reservation", RES)], |c, cfg| {
-            Box::pin(async move { reservation_set(&c, &cfg, res, false).await })
+            Box::pin(async move { reservation_set(&c, &cfg, res).await })
         })
         .unwrap();
         assert_eq!(p.action, Action::Update);
@@ -422,8 +401,8 @@ mod tests {
 
     #[test]
     fn reconfigure_plan_lists_the_call() {
-        let p = reconfigure_plan(Module::Dhcp, false);
-        assert!(p.dry_run && p.result.is_none());
+        let p = reconfigure_plan(Module::Dhcp);
+        assert!(!p.dry_run && p.result.is_none());
         assert_eq!(p.steps, ["POST kea/service/reconfigure"]);
     }
 }
