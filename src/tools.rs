@@ -20,6 +20,9 @@
 //!   - `opnsense.wireguard.handshakes`          per-peer handshake age, flagging stale tunnels
 //!   - `opnsense.netflow.health`                NetFlow capture/collection + flowd service state
 //!   - `opnsense.netflow.repair`                re-enable collection and restart stopped flowd services
+//!   - `opnsense.nat.forward.list`              list destination NAT port forwards
+//!   - `opnsense.nat.forward.set`               upsert a port forward by description; undoes the write on a failed apply/health check
+//!   - `opnsense.nat.forward.delete`            delete a port forward by description; undoes the write on a failed apply/health check
 //!
 //! Every mutating verb needs the admin role (also for its dry run) and is
 //! execute-gated: it applies unless the caller passes `dryRun`. A `set` or
@@ -30,6 +33,7 @@ use plugin_toolkit::prelude::*;
 use plugin_toolkit::reqwest;
 
 use crate::authz::require_admin;
+use crate::nat::{FilterRule, NatProtocol, NatWritePlan, PortForward, WriteOptions};
 use crate::plan::{Action, ReconfigurePlan, WritePlan};
 use crate::{
     Config, DotUpstream, HostOverride, Module, NetflowHealth, NetflowRepair, PiaForwardedPort,
@@ -54,6 +58,7 @@ pub struct OpnsenseEndpoint {
     pub api_secret: String,
     pub insecure: bool,
     pub enabled: bool,
+    pub management_ports: Option<String>,
 }
 
 // ── HTTP client helper ─────────────────────────────────────────────────────
@@ -72,6 +77,13 @@ pub(crate) async fn resolve_config(name: &str) -> Result<Config> {
         api_secret,
         insecure: row.insecure,
     })
+}
+
+fn endpoint_management_ports(name: &str) -> Result<Vec<u16>> {
+    let row = endpoint_db::require(name)?;
+    Ok(crate::nat::parse_management_ports(
+        row.management_ports.as_deref(),
+    )?)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -581,6 +593,177 @@ async fn opnsense_netflow_repair(args: EndpointArgs, ctx: &ToolCtx) -> Result<Ne
     let cfg = resolve_config(&args.name).await?;
     let client = cfg.build_client()?;
     Ok(crate::repair_netflow(&client, &cfg).await?)
+}
+
+/// List the user-defined destination NAT (port-forward) rules.
+#[orca_tool(domain = "opnsense", verb = "nat.forward.list", role = "any")]
+async fn opnsense_nat_forward_list(args: EndpointArgs, _ctx: &ToolCtx) -> Result<Vec<PortForward>> {
+    let cfg = resolve_config(&args.name).await?;
+    let client = cfg.build_client()?;
+    Ok(crate::nat::list_port_forwards(&client, &cfg).await?)
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct NatForwardArgs {
+    /// Registered opnsense endpoint name.
+    #[arg(long)]
+    pub name: String,
+    /// Rule description; the upsert key. Stored with an `orca:` prefix.
+    #[arg(long)]
+    pub description: String,
+    /// Interface id the rule listens on. Only `wan` counts as WAN; `opt*` and
+    /// every other interface are treated as non-WAN.
+    #[arg(long, default_value = "wan")]
+    #[serde(default = "default_interface")]
+    pub interface: String,
+    /// IP protocol; only `inet` is supported.
+    #[arg(long, default_value = "inet")]
+    #[serde(default = "default_ip_protocol")]
+    pub ip_protocol: String,
+    #[arg(long, value_enum)]
+    pub protocol: NatProtocol,
+    /// Destination: `wanip` (interface address), an alias, IPv4, IPv4/CIDR, or `any`.
+    #[arg(long, default_value = "wanip")]
+    #[serde(default = "default_destination")]
+    pub destination: String,
+    /// Destination port `N` or range `N-M`.
+    #[arg(long)]
+    pub destination_port: String,
+    /// Internal IPv4 address to forward to.
+    #[arg(long)]
+    pub target: String,
+    /// Internal port to forward to.
+    #[arg(long)]
+    pub target_port: String,
+    /// Associated filter rule: `pass`, `rule` (register linked rule), or `manual`.
+    #[arg(long, value_enum, default_value = "pass")]
+    #[serde(default = "default_filter_rule")]
+    pub filter_rule: FilterRule,
+    /// Create the rule disabled.
+    #[arg(long)]
+    #[serde(default)]
+    pub disabled: bool,
+    /// Take over an existing rule that lacks the `orca:` description prefix.
+    #[arg(long)]
+    #[serde(default)]
+    pub adopt: bool,
+    /// Permit a change on a non-WAN interface (anything but `wan`, including
+    /// `opt*`). NAT changes have no automatic rollback, so this is always
+    /// required off `wan`.
+    #[arg(long)]
+    #[serde(default)]
+    pub allow_unprotected: bool,
+}
+
+fn default_interface() -> String {
+    "wan".into()
+}
+
+fn default_ip_protocol() -> String {
+    "inet".into()
+}
+
+fn default_destination() -> String {
+    "wanip".into()
+}
+
+fn default_filter_rule() -> FilterRule {
+    FilterRule::Pass
+}
+
+/// [MUTATES STATE] Upsert an orca-owned (`orca:`-prefixed) port-forward keyed
+/// by description. An existing rule is snapshotted (`get_rule`) before it is
+/// changed; if apply or the post-apply health check fails, orca undoes the
+/// write (delete the created rule, or restore the snapshot) and re-applies,
+/// reporting whether that worked (`compensated`). The health check only proves
+/// the OPNsense API still answers orca, not that the forward works from WAN. OPNsense has no rollback for NAT, so
+/// `rollback_protected` is always false. An unchanged rule is left alone. Only
+/// an exact `wan` is WAN: if the current or desired interface is anything else
+/// (`opt*` and multi-interface rules included) `allow_unprotected` is
+/// required, and management ports (22/80/443 plus
+/// the endpoint's `management_ports`) may only forward to a literal host that
+/// is not a firewall address. `dryRun` previews.
+#[orca_tool(
+    domain = "opnsense",
+    verb = "nat.forward.set",
+    role = "admin",
+    data_mutation = true,
+    execute_gated = true
+)]
+async fn opnsense_nat_forward_set(args: NatForwardArgs, ctx: &ToolCtx) -> Result<NatWritePlan> {
+    require_admin(ctx)?;
+    let desired = PortForward {
+        uuid: None,
+        enabled: !args.disabled,
+        interface: args.interface,
+        ip_protocol: args.ip_protocol,
+        protocol: Some(args.protocol),
+        destination: args.destination,
+        destination_port: args.destination_port,
+        target: args.target,
+        target_port: args.target_port,
+        description: args.description,
+        filter_rule: args.filter_rule,
+    };
+    let management_ports = endpoint_management_ports(&args.name)?;
+    crate::nat::validate(&desired)?;
+    crate::nat::guard_management(&desired, &management_ports)?;
+    let opts = WriteOptions {
+        adopt: args.adopt,
+        allow_unprotected: args.allow_unprotected,
+        management_ports,
+    };
+    let cfg = resolve_config(&args.name).await?;
+    let client = cfg.build_client()?;
+    Ok(crate::nat::set_port_forward(&client, &cfg, desired, opts).await?)
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct NatForwardKeyArgs {
+    /// Registered opnsense endpoint name.
+    #[arg(long)]
+    pub name: String,
+    /// Description of the rule to delete.
+    #[arg(long)]
+    pub description: String,
+    /// Take over an existing rule that lacks the `orca:` description prefix.
+    #[arg(long)]
+    #[serde(default)]
+    pub adopt: bool,
+    /// Permit a change on a non-WAN interface (anything but `wan`, including
+    /// `opt*`). NAT changes have no automatic rollback, so this is always
+    /// required off `wan`.
+    #[arg(long)]
+    #[serde(default)]
+    pub allow_unprotected: bool,
+}
+
+/// [MUTATES STATE] Delete the orca-owned port-forward with this description,
+/// snapshotting it first and re-adding the snapshot (under a new uuid) if
+/// apply or the API health check fails. A rule on any interface but exactly `wan` (`opt*` and
+/// multi-interface included) needs `allow_unprotected`. An absent rule is a
+/// no-op. `dryRun` previews.
+#[orca_tool(
+    domain = "opnsense",
+    verb = "nat.forward.delete",
+    role = "admin",
+    data_mutation = true,
+    execute_gated = true
+)]
+async fn opnsense_nat_forward_delete(
+    args: NatForwardKeyArgs,
+    ctx: &ToolCtx,
+) -> Result<NatWritePlan> {
+    require_admin(ctx)?;
+    crate::nat::validate_description(&args.description)?;
+    let cfg = resolve_config(&args.name).await?;
+    let client = cfg.build_client()?;
+    let opts = WriteOptions {
+        adopt: args.adopt,
+        allow_unprotected: args.allow_unprotected,
+        management_ports: Vec::new(),
+    };
+    Ok(crate::nat::delete_port_forward(&client, &cfg, &args.description, opts).await?)
 }
 
 #[cfg(test)]
