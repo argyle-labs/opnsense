@@ -17,6 +17,7 @@
 #![allow(clippy::disallowed_types)]
 
 pub mod authz;
+pub mod nat;
 pub mod plan;
 pub mod tools;
 
