@@ -74,6 +74,25 @@ orca service.backup opnsense      # pull config.xml
 orca service.configure opnsense   # apply config via the opnsense API
 ```
 
+### API privileges
+
+OPNsense checks every API call against the privileges of the user that owns the API key, and answers `403 Forbidden` when one is missing. Grant these in *System → Access → Groups* (or *Users*) → *Assigned Privileges* for the API key's user or its group:
+
+| Tool | Endpoint(s) | Privilege |
+|---|---|---|
+| `opnsense.status` | `GET unbound/service/status` | Services: Unbound |
+| `opnsense.unbound.hostoverride.*` | `unbound/settings/*_host_override`, `unbound/service/reconfigure` | Services: Unbound (or Services: Unbound DNS: Edit Host and Domain Override) |
+| `opnsense.unbound.dot.*` | `unbound/settings/*_dot`, `unbound/service/reconfigure` | Services: Unbound |
+| `opnsense.dhcp.reservation.*` | `kea/dhcpv4/*_reservation`, `kea/service/reconfigure` | Services: DHCP: Kea(v4) |
+| `opnsense.wireguard.handshakes` | `GET wireguard/service/show` | VPN: WireGuard: Status |
+| `opnsense.netflow.health` / `.repair` | `diagnostics/netflow/*` + `core/service/search` / `restart` | Diagnostics: Netflow configuration + Status: Services |
+| `opnsense.pia.forwarded_port` | `GET firewall/alias/searchItem`, `getAliasUUID`, `getItem` | Firewall: Aliases |
+| `opnsense.nat.forward.*` | `firewall/d_nat/*` (+ `diagnostics/interface/get_interface_config` on writes) | Firewall: NAT: Destination NAT (+ unknown for `get_interface_config`: no core ACL entry; `opnsense.privileges` probes it) |
+
+Privilege names come from the opnsense/core master ACL files: [Unbound](https://github.com/opnsense/core/blob/master/src/opnsense/mvc/app/models/OPNsense/Unbound/ACL/ACL.xml), [Kea](https://github.com/opnsense/core/blob/master/src/opnsense/mvc/app/models/OPNsense/Kea/ACL/ACL.xml), [Wireguard](https://github.com/opnsense/core/blob/master/src/opnsense/mvc/app/models/OPNsense/Wireguard/ACL/ACL.xml), [Diagnostics](https://github.com/opnsense/core/blob/master/src/opnsense/mvc/app/models/OPNsense/Diagnostics/ACL/ACL.xml), [Core](https://github.com/opnsense/core/blob/master/src/opnsense/mvc/app/models/OPNsense/Core/ACL/ACL.xml).
+
+`orca opnsense.privileges --name <endpoint>` probes each tool's read endpoint and lists the privileges that came back 403. A 403 from any tool names the endpoint and the privilege it needs.
+
 ### NAT port forwards
 
 `opnsense.nat.forward.{list,set,delete}` manage destination NAT rules through `firewall/d_nat` (OPNsense 26.1+). `set` is an upsert keyed by description; orca stores and only touches rules prefixed `orca:` (pass `adopt` to take over an existing rule). Writes are admin-only and support `dryRun`.

@@ -20,6 +20,7 @@
 //!   - `opnsense.wireguard.handshakes`          per-peer handshake age, flagging stale tunnels
 //!   - `opnsense.netflow.health`                NetFlow capture/collection + flowd service state
 //!   - `opnsense.netflow.repair`                re-enable collection and restart stopped flowd services
+//!   - `opnsense.privileges`                    probe each tool's endpoint and report missing OPNsense privileges
 //!   - `opnsense.nat.forward.list`              list destination NAT port forwards
 //!   - `opnsense.nat.forward.set`               upsert a port forward by description; undoes the write on a failed apply/health check
 //!   - `opnsense.nat.forward.delete`            delete a port forward by description; undoes the write on a failed apply/health check
@@ -37,7 +38,7 @@ use crate::nat::{FilterRule, NatProtocol, NatWritePlan, PortForward, WriteOption
 use crate::plan::{Action, ReconfigurePlan, WritePlan};
 use crate::{
     Config, DotUpstream, HostOverride, Module, NetflowHealth, NetflowRepair, PiaForwardedPort,
-    Reservation, ServiceState, WireguardHandshakeReport,
+    PrivilegeReport, Reservation, ServiceState, WireguardHandshakeReport,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -593,6 +594,15 @@ async fn opnsense_netflow_repair(args: EndpointArgs, ctx: &ToolCtx) -> Result<Ne
     let cfg = resolve_config(&args.name).await?;
     let client = cfg.build_client()?;
     Ok(crate::repair_netflow(&client, &cfg).await?)
+}
+
+/// Probe each tool's read endpoint and report which OPNsense privileges the API
+/// key lacks (a 403 on the probe).
+#[orca_tool(domain = "opnsense", verb = "privileges", role = "any")]
+async fn opnsense_privileges(args: EndpointArgs, _ctx: &ToolCtx) -> Result<PrivilegeReport> {
+    let cfg = resolve_config(&args.name).await?;
+    let client = cfg.build_client()?;
+    Ok(crate::check_privileges(&client, &cfg).await?)
 }
 
 /// List the user-defined destination NAT (port-forward) rules.
