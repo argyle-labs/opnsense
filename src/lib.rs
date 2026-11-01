@@ -241,6 +241,13 @@ pub enum OpnsenseError {
     Transport(String),
     #[error("opnsense api error (status {status}): {body}")]
     Api { status: u16, body: String },
+    #[error(
+        "opnsense denied {endpoint} (403): the API key's user/group lacks the \"{privilege}\" privilege (System > Access > Groups/Users > Effective Privileges)"
+    )]
+    Forbidden {
+        endpoint: String,
+        privilege: &'static str,
+    },
     #[error("opnsense rejected the write (result={result}): {body}")]
     Rejected { result: String, body: String },
     #[error("malformed opnsense response: {0}")]
@@ -339,6 +346,44 @@ fn transport(e: impl std::fmt::Display) -> OpnsenseError {
 
 // ── generic request helpers ──────────────────────────────────────────────────
 
+/// OPNsense ACL privilege (as named in the GUI privilege list) guarding each
+/// `/api/<module>/<controller>/` prefix this plugin calls. First match wins.
+pub const PRIVILEGES: &[(&str, &str)] = &[
+    ("unbound/", "Services: Unbound DNS: General"),
+    ("kea/", "Services: Kea DHCP: DHCPv4"),
+    ("wireguard/", "VPN: WireGuard"),
+    ("diagnostics/netflow/", "Reporting: NetFlow"),
+    ("diagnostics/interface/", "Status: Interfaces"),
+    ("core/service/", "Status: Services"),
+    ("firewall/alias/", "Firewall: Alias: Edit"),
+    ("firewall/d_nat/", "Firewall: NAT: Port Forward"),
+];
+
+/// The `<module>/<controller>/<command>` part of an API URL, query stripped.
+fn api_path(url: &str) -> &str {
+    let path = url.split_once("/api/").map_or(url, |(_, p)| p);
+    path.split('?').next().unwrap_or(path)
+}
+
+/// Privilege OPNsense requires for `url`, or `None` for an unmapped endpoint.
+pub fn required_privilege(url: &str) -> Option<&'static str> {
+    let path = api_path(url);
+    PRIVILEGES
+        .iter()
+        .find(|(prefix, _)| path.starts_with(prefix))
+        .map(|(_, privilege)| *privilege)
+}
+
+fn api_error(url: &str, status: u16, body: String) -> OpnsenseError {
+    match (status, required_privilege(url)) {
+        (403, Some(privilege)) => OpnsenseError::Forbidden {
+            endpoint: format!("/api/{}", api_path(url)),
+            privilege,
+        },
+        _ => OpnsenseError::Api { status, body },
+    }
+}
+
 /// `GET <url>` -> deserialize the JSON body into `T`.
 async fn get_json<T: DeserializeOwned>(
     client: &reqwest::Client,
@@ -348,10 +393,7 @@ async fn get_json<T: DeserializeOwned>(
     let status = resp.status();
     let body = resp.text().await.map_err(transport)?;
     if !status.is_success() {
-        return Err(OpnsenseError::Api {
-            status: status.as_u16(),
-            body,
-        });
+        return Err(api_error(url, status.as_u16(), body));
     }
     plugin_toolkit::serde_json::from_str(&body).map_err(|e| OpnsenseError::Malformed(e.to_string()))
 }
@@ -371,10 +413,7 @@ async fn post_json(
     let status = resp.status();
     let text = resp.text().await.map_err(transport)?;
     if !status.is_success() {
-        return Err(OpnsenseError::Api {
-            status: status.as_u16(),
-            body: text,
-        });
+        return Err(api_error(url, status.as_u16(), text));
     }
     plugin_toolkit::serde_json::from_str(&text).map_err(|e| OpnsenseError::Malformed(e.to_string()))
 }
@@ -1107,6 +1146,84 @@ pub async fn status(client: &reqwest::Client, cfg: &Config) -> Result<ServiceSta
     get_json(client, &url).await
 }
 
+/// Read-only probe per tool: the GET each tool depends on.
+pub const PRIVILEGE_PROBES: &[(&str, &str)] = &[
+    ("opnsense.status", "unbound/service/status"),
+    (
+        "opnsense.unbound.hostoverride.list",
+        "unbound/settings/search_host_override",
+    ),
+    ("opnsense.unbound.dot.list", "unbound/settings/search_dot"),
+    (
+        "opnsense.dhcp.reservation.list",
+        "kea/dhcpv4/search_reservation",
+    ),
+    ("opnsense.wireguard.handshakes", "wireguard/service/show"),
+    ("opnsense.netflow.health", "diagnostics/netflow/isEnabled"),
+    (
+        "opnsense.netflow.health",
+        "core/service/search?searchPhrase=flowd&rowCount=-1",
+    ),
+    ("opnsense.pia.forwarded_port", "firewall/alias/searchItem"),
+    (
+        "opnsense.nat.forward.list",
+        "firewall/d_nat/search_rule?current=1&rowCount=-1",
+    ),
+    (
+        "opnsense.nat.forward.set",
+        "diagnostics/interface/get_interface_config",
+    ),
+];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PrivilegeCheck {
+    pub tool: String,
+    pub endpoint: String,
+    pub privilege: String,
+    pub granted: bool,
+    /// Error text when the probe failed for a reason other than a 403.
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PrivilegeReport {
+    pub checks: Vec<PrivilegeCheck>,
+    /// Distinct privileges denied with a 403, to grant to the API key's user/group.
+    pub missing: Vec<String>,
+}
+
+/// GET every [`PRIVILEGE_PROBES`] endpoint and report which privileges are denied.
+pub async fn check_privileges(
+    client: &reqwest::Client,
+    cfg: &Config,
+) -> Result<PrivilegeReport, OpnsenseError> {
+    let mut checks = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+    for (tool, path) in PRIVILEGE_PROBES {
+        let url = cfg.api_url(path);
+        let privilege = required_privilege(&url).unwrap_or_default().to_string();
+        let (granted, error) = match get_json::<Value>(client, &url).await {
+            Ok(_) => (true, None),
+            Err(OpnsenseError::Forbidden { .. }) => {
+                if !missing.contains(&privilege) {
+                    missing.push(privilege.clone());
+                }
+                (false, None)
+            }
+            Err(OpnsenseError::Transport(e)) => return Err(OpnsenseError::Transport(e)),
+            Err(e) => (true, Some(e.to_string())),
+        };
+        checks.push(PrivilegeCheck {
+            tool: tool.to_string(),
+            endpoint: format!("/api/{}", api_path(&url)),
+            privilege,
+            granted,
+            error,
+        });
+    }
+    Ok(PrivilegeReport { checks, missing })
+}
+
 /// Standard-alphabet base64 for the Basic auth header. Hand-rolled to keep the
 /// dependency set minimal (Basic auth is the only base64 use in the plugin).
 fn base64_encode(input: &[u8]) -> String {
@@ -1507,6 +1624,122 @@ mod tests {
             matches!(err, OpnsenseError::Api { status: 401, .. }),
             "{err}"
         );
+    }
+
+    #[test]
+    fn pia_port_names_the_missing_privilege_on_403() {
+        let err = pia_port_with_mock(
+            Some(ALIAS),
+            &[("/getAliasUUID/pia_vancouver_port", 403, r#"{"status":403}"#)],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OpnsenseError::Forbidden {
+                    privilege: "Firewall: Alias: Edit",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("/api/firewall/alias/getAliasUUID/pia_vancouver_port"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn every_probe_and_called_endpoint_maps_to_a_privilege() {
+        for (_, path) in PRIVILEGE_PROBES {
+            assert!(required_privilege(path).is_some(), "{path}");
+        }
+        let cfg = Config::new("https://host", "k", "s");
+        for path in [
+            "unbound/settings/add_host_override",
+            "unbound/service/reconfigure",
+            "kea/service/reconfigure",
+            "diagnostics/netflow/setconfig",
+            "core/service/restart/flowd",
+            "firewall/alias/getItem/x",
+            "firewall/d_nat/apply",
+        ] {
+            assert!(required_privilege(&cfg.api_url(path)).is_some(), "{path}");
+        }
+        assert_eq!(
+            required_privilege("https://host/api/wireguard/service/show?x=1"),
+            Some("VPN: WireGuard")
+        );
+        assert_eq!(required_privilege("https://host/api/system/x"), None);
+    }
+
+    #[test]
+    fn unmapped_403_stays_an_api_error() {
+        assert!(matches!(
+            api_error("https://host/api/system/x", 403, "no".into()),
+            OpnsenseError::Api { status: 403, .. }
+        ));
+    }
+
+    #[test]
+    fn privilege_report_lists_denied_privileges_once() {
+        use plugin_toolkit::abi::{HttpRequest, HttpResponse};
+        let sink = Box::new(|_: &str, op: &str| {
+            let req: HttpRequest = plugin_toolkit::serde_json::from_str(op).unwrap();
+            assert_eq!(req.method, "GET");
+            let status = if req.url.contains("/api/firewall/d_nat/") {
+                200
+            } else if req.url.contains("/api/kea/") {
+                500
+            } else {
+                403
+            };
+            Ok::<String, String>(
+                plugin_toolkit::serde_json::to_string(&HttpResponse {
+                    status,
+                    headers: vec![],
+                    body: b"{}".to_vec(),
+                })
+                .unwrap(),
+            )
+        });
+        let cfg = Config::new("https://10.0.0.1", "k", "s").insecure(true);
+        let report = plugin_toolkit::capsink::with_cap_sink(sink, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let client = cfg.build_client()?;
+                check_privileges(&client, &cfg).await
+            })
+        })
+        .unwrap();
+        assert_eq!(report.checks.len(), PRIVILEGE_PROBES.len());
+        assert_eq!(
+            report.missing,
+            vec![
+                "Services: Unbound DNS: General",
+                "VPN: WireGuard",
+                "Reporting: NetFlow",
+                "Status: Services",
+                "Firewall: Alias: Edit",
+                "Status: Interfaces",
+            ]
+        );
+        let nat = report
+            .checks
+            .iter()
+            .find(|c| c.tool == "opnsense.nat.forward.list")
+            .unwrap();
+        assert!(nat.granted && nat.error.is_none());
+        assert_eq!(nat.endpoint, "/api/firewall/d_nat/search_rule");
+        let kea = report
+            .checks
+            .iter()
+            .find(|c| c.tool == "opnsense.dhcp.reservation.list")
+            .unwrap();
+        assert!(kea.granted && kea.error.is_some());
     }
 
     #[test]
