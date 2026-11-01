@@ -89,7 +89,7 @@ OPNsense checks every API call against the privileges of the user that owns the 
 | `opnsense.pia.forwarded_port` | `GET firewall/alias/searchItem`, `getAliasUUID`, `getItem` | Firewall: Aliases |
 | `opnsense.nat.forward.*` | `firewall/d_nat/*` (+ `diagnostics/interface/get_interface_config` on writes) | Firewall: NAT: Destination NAT (+ unknown for `get_interface_config`: no core ACL entry; `opnsense.privileges` probes it) |
 
-Privilege names come from the per-module `ACL/ACL.xml` files in [opnsense/core master](https://github.com/opnsense/core/tree/master/src/opnsense/mvc/app/models/OPNsense) (e.g. `Unbound/ACL/ACL.xml`).
+Privilege names come from the opnsense/core master ACL files: [Unbound](https://github.com/opnsense/core/blob/master/src/opnsense/mvc/app/models/OPNsense/Unbound/ACL/ACL.xml), [Kea](https://github.com/opnsense/core/blob/master/src/opnsense/mvc/app/models/OPNsense/Kea/ACL/ACL.xml), [Wireguard](https://github.com/opnsense/core/blob/master/src/opnsense/mvc/app/models/OPNsense/Wireguard/ACL/ACL.xml), [Diagnostics](https://github.com/opnsense/core/blob/master/src/opnsense/mvc/app/models/OPNsense/Diagnostics/ACL/ACL.xml), [Core](https://github.com/opnsense/core/blob/master/src/opnsense/mvc/app/models/OPNsense/Core/ACL/ACL.xml).
 
 `orca opnsense.privileges --name <endpoint>` probes each tool's read endpoint and lists the privileges that came back 403. A 403 from any tool names the endpoint and the privilege it needs.
 
