@@ -241,9 +241,7 @@ pub enum OpnsenseError {
     Transport(String),
     #[error("opnsense api error (status {status}): {body}")]
     Api { status: u16, body: String },
-    #[error(
-        "opnsense denied {endpoint} (403): the API key's user/group lacks the \"{privilege}\" privilege (System > Access > Groups/Users > Effective Privileges)"
-    )]
+    #[error("{}", forbidden_message(endpoint, privilege))]
     Forbidden {
         endpoint: String,
         privilege: &'static str,
@@ -348,16 +346,32 @@ fn transport(e: impl std::fmt::Display) -> OpnsenseError {
 
 /// OPNsense ACL privilege (as named in the GUI privilege list) guarding each
 /// `/api/<module>/<controller>/` prefix this plugin calls. First match wins.
+/// Names follow opnsense/core `ACL.xml`; [`UNKNOWN_PRIVILEGE`] marks an
+/// endpoint with no core ACL entry.
 pub const PRIVILEGES: &[(&str, &str)] = &[
-    ("unbound/", "Services: Unbound DNS: General"),
-    ("kea/", "Services: Kea DHCP: DHCPv4"),
-    ("wireguard/", "VPN: WireGuard"),
-    ("diagnostics/netflow/", "Reporting: NetFlow"),
-    ("diagnostics/interface/", "Status: Interfaces"),
+    ("unbound/", "Services: Unbound"),
+    ("kea/", "Services: DHCP: Kea(v4)"),
+    ("wireguard/", "VPN: WireGuard: Status"),
+    ("diagnostics/netflow/", "Diagnostics: Netflow configuration"),
+    ("diagnostics/interface/", UNKNOWN_PRIVILEGE),
     ("core/service/", "Status: Services"),
-    ("firewall/alias/", "Firewall: Alias: Edit"),
-    ("firewall/d_nat/", "Firewall: NAT: Port Forward"),
+    ("firewall/alias/", "Firewall: Aliases"),
+    ("firewall/d_nat/", "Firewall: NAT: Destination NAT"),
 ];
+
+pub const UNKNOWN_PRIVILEGE: &str = "unknown";
+
+fn forbidden_message(endpoint: &str, privilege: &str) -> String {
+    if privilege == UNKNOWN_PRIVILEGE {
+        format!(
+            "opnsense denied {endpoint} (403): the privilege it needs is unknown; run `opnsense.privileges` to probe it live"
+        )
+    } else {
+        format!(
+            "opnsense denied {endpoint} (403): the API key's user/group lacks the \"{privilege}\" privilege (System > Access > Groups/Users > Effective Privileges)"
+        )
+    }
+}
 
 /// The `<module>/<controller>/<command>` part of an API URL, query stripped.
 fn api_path(url: &str) -> &str {
@@ -1637,7 +1651,7 @@ mod tests {
             matches!(
                 err,
                 OpnsenseError::Forbidden {
-                    privilege: "Firewall: Alias: Edit",
+                    privilege: "Firewall: Aliases",
                     ..
                 }
             ),
@@ -1669,9 +1683,19 @@ mod tests {
         }
         assert_eq!(
             required_privilege("https://host/api/wireguard/service/show?x=1"),
-            Some("VPN: WireGuard")
+            Some("VPN: WireGuard: Status")
         );
         assert_eq!(required_privilege("https://host/api/system/x"), None);
+        let msg = api_error(
+            "https://host/api/diagnostics/interface/get_interface_config",
+            403,
+            String::new(),
+        )
+        .to_string();
+        assert!(
+            msg.contains("unknown") && msg.contains("opnsense.privileges"),
+            "{msg}"
+        );
     }
 
     #[test]
@@ -1719,12 +1743,12 @@ mod tests {
         assert_eq!(
             report.missing,
             vec![
-                "Services: Unbound DNS: General",
-                "VPN: WireGuard",
-                "Reporting: NetFlow",
+                "Services: Unbound",
+                "VPN: WireGuard: Status",
+                "Diagnostics: Netflow configuration",
                 "Status: Services",
-                "Firewall: Alias: Edit",
-                "Status: Interfaces",
+                "Firewall: Aliases",
+                UNKNOWN_PRIVILEGE,
             ]
         );
         let nat = report

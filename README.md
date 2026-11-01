@@ -80,14 +80,16 @@ OPNsense checks every API call against the privileges of the user that owns the 
 
 | Tool | Endpoint(s) | Privilege |
 |---|---|---|
-| `opnsense.status` | `GET unbound/service/status` | Services: Unbound DNS: General |
-| `opnsense.unbound.hostoverride.*` | `unbound/settings/*_host_override`, `unbound/service/reconfigure` | Services: Unbound DNS: General |
-| `opnsense.unbound.dot.*` | `unbound/settings/*_dot`, `unbound/service/reconfigure` | Services: Unbound DNS: General |
-| `opnsense.dhcp.reservation.*` | `kea/dhcpv4/*_reservation`, `kea/service/reconfigure` | Services: Kea DHCP: DHCPv4 |
-| `opnsense.wireguard.handshakes` | `GET wireguard/service/show` | VPN: WireGuard |
-| `opnsense.netflow.health` / `.repair` | `diagnostics/netflow/*` + `core/service/search` / `restart` | Reporting: NetFlow + Status: Services |
-| `opnsense.pia.forwarded_port` | `GET firewall/alias/searchItem`, `getAliasUUID`, `getItem` | Firewall: Alias: Edit |
-| `opnsense.nat.forward.*` | `firewall/d_nat/*` (+ `diagnostics/interface/get_interface_config` on writes) | Firewall: NAT: Port Forward (+ Status: Interfaces) |
+| `opnsense.status` | `GET unbound/service/status` | Services: Unbound |
+| `opnsense.unbound.hostoverride.*` | `unbound/settings/*_host_override`, `unbound/service/reconfigure` | Services: Unbound (or Services: Unbound DNS: Edit Host and Domain Override) |
+| `opnsense.unbound.dot.*` | `unbound/settings/*_dot`, `unbound/service/reconfigure` | Services: Unbound |
+| `opnsense.dhcp.reservation.*` | `kea/dhcpv4/*_reservation`, `kea/service/reconfigure` | Services: DHCP: Kea(v4) |
+| `opnsense.wireguard.handshakes` | `GET wireguard/service/show` | VPN: WireGuard: Status |
+| `opnsense.netflow.health` / `.repair` | `diagnostics/netflow/*` + `core/service/search` / `restart` | Diagnostics: Netflow configuration + Status: Services |
+| `opnsense.pia.forwarded_port` | `GET firewall/alias/searchItem`, `getAliasUUID`, `getItem` | Firewall: Aliases |
+| `opnsense.nat.forward.*` | `firewall/d_nat/*` (+ `diagnostics/interface/get_interface_config` on writes) | Firewall: NAT: Destination NAT (+ unknown for `get_interface_config`: no core ACL entry; `opnsense.privileges` probes it) |
+
+Privilege names come from the per-module `ACL/ACL.xml` files in [opnsense/core master](https://github.com/opnsense/core/tree/master/src/opnsense/mvc/app/models/OPNsense) (e.g. `Unbound/ACL/ACL.xml`).
 
 `orca opnsense.privileges --name <endpoint>` probes each tool's read endpoint and lists the privileges that came back 403. A 403 from any tool names the endpoint and the privilege it needs.
 
