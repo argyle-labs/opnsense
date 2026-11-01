@@ -1189,13 +1189,22 @@ pub const PRIVILEGE_PROBES: &[(&str, &str)] = &[
     ),
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Access {
+    Granted,
+    Denied,
+    /// The probe failed for a reason other than a 403, so the grant is undetermined.
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PrivilegeCheck {
     pub tool: String,
     pub endpoint: String,
     pub privilege: String,
-    pub granted: bool,
-    /// Error text when the probe failed for a reason other than a 403.
+    pub access: Access,
+    /// Failure kind for an `unknown` probe; never carries the response body.
     pub error: Option<String>,
 }
 
@@ -1204,6 +1213,16 @@ pub struct PrivilegeReport {
     pub checks: Vec<PrivilegeCheck>,
     /// Distinct privileges denied with a 403, to grant to the API key's user/group.
     pub missing: Vec<String>,
+    /// Endpoints whose probe failed for a reason other than a 403.
+    pub unknown: Vec<String>,
+}
+
+fn probe_failure(e: &OpnsenseError) -> String {
+    match e {
+        OpnsenseError::Api { status, .. } => format!("status {status}"),
+        OpnsenseError::Malformed(_) => "malformed response".to_string(),
+        _ => "probe failed".to_string(),
+    }
 }
 
 /// GET every [`PRIVILEGE_PROBES`] endpoint and report which privileges are denied.
@@ -1213,29 +1232,38 @@ pub async fn check_privileges(
 ) -> Result<PrivilegeReport, OpnsenseError> {
     let mut checks = Vec::new();
     let mut missing: Vec<String> = Vec::new();
+    let mut unknown: Vec<String> = Vec::new();
     for (tool, path) in PRIVILEGE_PROBES {
         let url = cfg.api_url(path);
         let privilege = required_privilege(&url).unwrap_or_default().to_string();
-        let (granted, error) = match get_json::<Value>(client, &url).await {
-            Ok(_) => (true, None),
+        let endpoint = format!("/api/{}", api_path(&url));
+        let (access, error) = match get_json::<Value>(client, &url).await {
+            Ok(_) => (Access::Granted, None),
             Err(OpnsenseError::Forbidden { .. }) => {
                 if !missing.contains(&privilege) {
                     missing.push(privilege.clone());
                 }
-                (false, None)
+                (Access::Denied, None)
             }
             Err(OpnsenseError::Transport(e)) => return Err(OpnsenseError::Transport(e)),
-            Err(e) => (true, Some(e.to_string())),
+            Err(e) => {
+                unknown.push(endpoint.clone());
+                (Access::Unknown, Some(probe_failure(&e)))
+            }
         };
         checks.push(PrivilegeCheck {
             tool: tool.to_string(),
-            endpoint: format!("/api/{}", api_path(&url)),
+            endpoint,
             privilege,
-            granted,
+            access,
             error,
         });
     }
-    Ok(PrivilegeReport { checks, missing })
+    Ok(PrivilegeReport {
+        checks,
+        missing,
+        unknown,
+    })
 }
 
 /// Standard-alphabet base64 for the Basic auth header. Hand-rolled to keep the
@@ -1723,7 +1751,11 @@ mod tests {
                 plugin_toolkit::serde_json::to_string(&HttpResponse {
                     status,
                     headers: vec![],
-                    body: b"{}".to_vec(),
+                    body: if status == 500 {
+                        br#"{"error":"db password hunter2-SECRET"}"#.to_vec()
+                    } else {
+                        b"{}".to_vec()
+                    },
                 })
                 .unwrap(),
             )
@@ -1756,14 +1788,19 @@ mod tests {
             .iter()
             .find(|c| c.tool == "opnsense.nat.forward.list")
             .unwrap();
-        assert!(nat.granted && nat.error.is_none());
+        assert!(nat.access == Access::Granted && nat.error.is_none());
         assert_eq!(nat.endpoint, "/api/firewall/d_nat/search_rule");
         let kea = report
             .checks
             .iter()
             .find(|c| c.tool == "opnsense.dhcp.reservation.list")
             .unwrap();
-        assert!(kea.granted && kea.error.is_some());
+        assert_eq!(kea.access, Access::Unknown);
+        assert_eq!(kea.error.as_deref(), Some("status 500"));
+        assert_eq!(report.unknown, vec![kea.endpoint.clone()]);
+        assert!(!report.missing.iter().any(|m| m == &kea.privilege));
+        let json = plugin_toolkit::serde_json::to_string(&report).unwrap();
+        assert!(!json.contains("hunter2-SECRET"));
     }
 
     #[test]
